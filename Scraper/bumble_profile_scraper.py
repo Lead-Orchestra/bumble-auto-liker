@@ -352,10 +352,8 @@ def extract_profile_data(browser: webdriver.Chrome) -> Optional[Dict]:
                             break
         except Exception as e:
             print(f"{YELLOW} Error extracting name/age: {e}")
-            if "name" not in profile_data:
-                profile_data["name"] = None
-            if "age" not in profile_data:
-                profile_data["age"] = None
+            # Don't set name/age to None - let validation handle it
+            pass
         
         # Age should already be extracted above, but add fallback if missing
         if "age" not in profile_data or profile_data["age"] is None:
@@ -1011,11 +1009,14 @@ def extract_profile_data(browser: webdriver.Chrome) -> Optional[Dict]:
             except:
                 pass
         
+        # Validate that we have at least a name (required)
+        profile_name = profile_data.get("name")
+        if not profile_name or not isinstance(profile_name, str) or not profile_name.strip() or profile_name.lower() in ['none', 'null', 'undefined']:
+            print(f"{YELLOW} Warning: Could not extract valid name from profile - returning None")
+            return None
+        
         # Print extracted data summary
-        if profile_data.get("name"):
-            print(f"{GREEN} Profile extracted: {profile_data.get('name', 'Unknown')} ({profile_data.get('age', '?')})")
-        else:
-            print(f"{YELLOW} Warning: Could not extract name from profile")
+        print(f"{GREEN} Profile extracted: {profile_data.get('name', 'Unknown')} ({profile_data.get('age', '?')})")
         
         return profile_data
         
@@ -1827,17 +1828,19 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
             # Reset failure counter on successful extraction
             consecutive_failures = 0
             
-            # Add profile data
-            if profile_data.get("name"):
+            # Only add profile data if it has a valid name
+            profile_name = profile_data.get("name")
+            if profile_name and profile_name.strip() and profile_name.lower() not in ['none', 'null', 'undefined']:
                 all_profiles.append(profile_data)
                 profile_count += 1
                 print(f"{GREEN} Extracted: {profile_data.get('name', 'Unknown')} ({profile_data.get('age', '?')})")
             else:
-                print(f"{YELLOW} Warning: Profile data incomplete (missing name)")
-                # Still save it, but mark as incomplete
-                profile_data["_incomplete"] = True
-                all_profiles.append(profile_data)
-                profile_count += 1
+                print(f"{YELLOW} Warning: Profile data incomplete (missing or invalid name) - skipping")
+                consecutive_failures += 1
+                # Don't add incomplete profiles to the list
+                # Wait a bit and try again
+                time.sleep(2)
+                continue
             
             # Swipe right after extraction (unless --no-swipe is set)
             if no_swipe:
