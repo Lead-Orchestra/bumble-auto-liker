@@ -18,6 +18,10 @@ env/
 # IDE
 .vscode/
 .idea/
+
+# Debug files
+bumble_*_debug.html
+bumble_cookies.json
 *.swp
 *.swo
 *~
