@@ -162,8 +162,37 @@ def extract_profile_data(browser: webdriver.Chrome) -> Optional[Dict]:
         print(f"{CYAN} Attempting to extract profile data...")
         print(f"{CYAN} Current URL: {browser.current_url}")
         
-        # Wait a bit for all profile sections to load (bio, questions, location, Spotify, etc.)
+        # Wait for initial profile to load
+        print(f"{CYAN} Waiting for profile to load...")
         time.sleep(2)
+        
+        # Based on HTML structure, all profile data is already in the DOM
+        # The encounters-album contains all story sections (About, Questions, Location, etc.)
+        # We don't need to scroll - just wait for the DOM to be fully loaded
+        try:
+            print(f"{CYAN} Checking if all profile sections are in DOM...")
+            
+            # Wait a bit more for any lazy-loaded content
+            time.sleep(2)
+            
+            # Verify key sections are present in DOM (they should all be there)
+            try:
+                about_section = browser.find_elements(By.CSS_SELECTOR, '.encounters-story-section--about')
+                question_sections = browser.find_elements(By.CSS_SELECTOR, '.encounters-story-section--question')
+                location_section = browser.find_elements(By.CSS_SELECTOR, '.encounters-story-section--location')
+                badges = browser.find_elements(By.CSS_SELECTOR, '.encounters-story-about__badge')
+                
+                print(f"{CYAN} Found sections in DOM: About={len(about_section)}, Questions={len(question_sections)}, Location={len(location_section)}, Badges={len(badges)}")
+                
+                # If sections are missing, wait a bit more (they might be loading)
+                if len(about_section) == 0 and len(question_sections) == 0:
+                    print(f"{YELLOW} Sections not found yet, waiting a bit more...")
+                    time.sleep(2)
+            except Exception as e:
+                print(f"{YELLOW} Error checking sections: {e}")
+                
+        except Exception as e:
+            print(f"{YELLOW} Error during section check: {e}")
         
         # Save current HTML for debugging
         try:
@@ -234,71 +263,81 @@ def extract_profile_data(browser: webdriver.Chrome) -> Optional[Dict]:
             "extracted_at": datetime.now().isoformat(),
         }
         
-        # Extract name and age from article text (format: "Name, Age")
-        # Bumble structure: article.encounters-story contains text like "Haley, 30"
-        # Also check article.encounters-album which contains the first visible profile
+        # Extract name and age from specific selectors (more reliable than regex)
+        # HTML structure: .encounters-story-profile__name and .encounters-story-profile__age
         try:
-            import re
-            
-            # Use the profile element we found (should be encounters-album for first profile)
-            # If it's encounters-story, try to get the album element which contains the main profile info
-            article_text = profile_element.text
-            
-            # If we're using encounters-story, try to find the album element for better extraction
-            if 'encounters-story' in (profile_element.get_attribute('class') or ''):
-                try:
-                    album_elements = browser.find_elements(By.CSS_SELECTOR, 'article.encounters-album')
-                    if album_elements and album_elements[0].is_displayed():
-                        # Use album element for better name/age extraction
-                        article_text = album_elements[0].text
-                        print(f"{CYAN} Using encounters-album for name/age extraction")
-                except:
-                    pass
-            
-            # Try to find name/age pattern in text (e.g., "Jexe, 30" or "Haley, 30")
-            # Pattern: Name (with possible newline) comma space Age
-            # Handle format like "Jexe\n, 30" or "Haley, 30"
-            
-            # Try multiple patterns to handle different text formats
-            name_age_patterns = [
-                r'^([^\n,]+?)\s*,\s*(\d{2})\b',  # Start: "Name, 30" or "Name\n, 30"
-                r'^([A-Z][^\n,]+?)\s*,\s*(\d{2})\b',  # Capitalized name: "Jexe, 30"
-                r'([A-Z][a-zA-Z]+)\s*,\s*(\d{2})\b',  # Simple: "Name, 30"
+            # Try direct selectors first (most reliable)
+            name_selectors = [
+                '.encounters-story-profile__name',  # Found in HTML: <span class="encounters-story-profile__name">Kristine</span>
+                '.encounters-story-profile__user .encounters-story-profile__name',
+                'article.encounters-album .encounters-story-profile__name',
             ]
             
-            match = None
-            for pattern in name_age_patterns:
-                match = re.search(pattern, article_text, re.MULTILINE)
-                if match:
-                    name = match.group(1).strip()
-                    # Remove newlines from name
-                    name = re.sub(r'\s+', ' ', name).strip()
-                    age = int(match.group(2))
-                    # Validate: name should be reasonable length and age should be 18-99
-                    if 2 <= len(name) <= 50 and 18 <= age <= 99:
-                        profile_data["name"] = name
-                        profile_data["age"] = age
-                        print(f"{CYAN} Extracted name and age: {profile_data['name']}, {profile_data['age']}")
-                        break
-                    else:
-                        match = None
+            age_selectors = [
+                '.encounters-story-profile__age',  # Found in HTML: <span class="encounters-story-profile__age">, 28</span>
+                '.encounters-story-profile__user .encounters-story-profile__age',
+                'article.encounters-album .encounters-story-profile__age',
+            ]
             
-            if not match:
-                # Fallback: try to find name in section headings (e.g., "Haley's location" or "Jexe's location")
+            # Extract name
+            for selector in name_selectors:
                 try:
-                    heading_pattern = r"([A-Z][a-zA-Z]+)'s\s+location"
-                    match = re.search(heading_pattern, article_text, re.I)
+                    name_elem = browser.find_element(By.CSS_SELECTOR, selector)
+                    name_text = name_elem.text.strip()
+                    if name_text and 2 <= len(name_text) <= 50:
+                        profile_data["name"] = name_text
+                        print(f"{CYAN} Extracted name: {profile_data['name']}")
+                        break
+                except:
+                    continue
+            
+            # Extract age
+            for selector in age_selectors:
+                try:
+                    age_elem = browser.find_element(By.CSS_SELECTOR, selector)
+                    age_text = age_elem.text.strip()
+                    # Remove comma and extract number (format: ", 28" or "28")
+                    import re
+                    age_match = re.search(r'(\d{2})', age_text)
+                    if age_match:
+                        age = int(age_match.group(1))
+                        if 18 <= age <= 99:
+                            profile_data["age"] = age
+                            print(f"{CYAN} Extracted age: {profile_data['age']}")
+                            break
+                except:
+                    continue
+            
+            # Fallback: try regex on article text if direct selectors failed
+            if not profile_data.get("name") or not profile_data.get("age"):
+                import re
+                article_text = profile_element.text
+                
+                # Try to find name/age pattern in text (e.g., "Kristine, 28")
+                name_age_patterns = [
+                    r'^([^\n,]+?)\s*,\s*(\d{2})\b',  # Start: "Name, 28"
+                    r'([A-Z][a-zA-Z]+)\s*,\s*(\d{2})\b',  # Simple: "Name, 28"
+                ]
+                
+                for pattern in name_age_patterns:
+                    match = re.search(pattern, article_text, re.MULTILINE)
                     if match:
                         name = match.group(1).strip()
-                        if 2 <= len(name) <= 50:
-                            profile_data["name"] = name
-                            print(f"{CYAN} Extracted name from heading: {profile_data['name']}")
-                except:
-                    pass
+                        name = re.sub(r'\s+', ' ', name).strip()
+                        age = int(match.group(2))
+                        if 2 <= len(name) <= 50 and 18 <= age <= 99:
+                            if not profile_data.get("name"):
+                                profile_data["name"] = name
+                            if not profile_data.get("age"):
+                                profile_data["age"] = age
+                            print(f"{CYAN} Extracted name/age (fallback): {profile_data.get('name')}, {profile_data.get('age')}")
+                            break
         except Exception as e:
             print(f"{YELLOW} Error extracting name/age: {e}")
-            profile_data["name"] = None
-            profile_data["age"] = None
+            if "name" not in profile_data:
+                profile_data["name"] = None
+            if "age" not in profile_data:
+                profile_data["age"] = None
         
         # Age should already be extracted above, but add fallback if missing
         if "age" not in profile_data or profile_data["age"] is None:
@@ -317,15 +356,13 @@ def extract_profile_data(browser: webdriver.Chrome) -> Optional[Dict]:
         
         # Extract bio/description - Bumble uses encounters-story-about__text
         # Search entire page, not just profile_element, as bio is in encounters-story sections
+        # NOTE: Not all profiles have bios - this is normal
         try:
             bio_selectors = [
-                '.encounters-story-about__text',  # Found in HTML
-                '.encounters-story-section--about .encounters-story-about__text',
+                '.encounters-story-section--about .encounters-story-about__text',  # Primary: bio in "About" section
+                '.encounters-story-about__text',  # Fallback
+                '.encounters-story-section--about p',
                 '.encounters-story-section__content p',
-                '.encounters-story-about',
-                '[class*="story-about"]',
-                '.encounters-story-viewer__bio',
-                '.encounters-card__bio',
             ]
             bio_parts = []
             for selector in bio_selectors:
@@ -334,17 +371,38 @@ def extract_profile_data(browser: webdriver.Chrome) -> Optional[Dict]:
                     bio_elems = browser.find_elements(By.CSS_SELECTOR, selector)
                     for bio_elem in bio_elems:
                         try:
-                            # Don't require is_displayed() - elements might be in DOM but not visible in headless
-                            bio_text = bio_elem.text.strip()
-                            if bio_text and bio_text not in bio_parts and len(bio_text) > 10:  # Filter short text
-                                bio_parts.append(bio_text)
+                            # Check if this is in the "About" section (not question answers)
+                            parent = bio_elem.find_element(By.XPATH, './ancestor::section[contains(@class, "encounters-story-section")]')
+                            section_class = parent.get_attribute('class') or ''
+                            
+                            # Only extract from "About" section, not question sections
+                            if 'encounters-story-section--about' in section_class or 'encounters-story-section--question' not in section_class:
+                                bio_text = bio_elem.text.strip()
+                                # Filter out question answers (they're usually longer and have different structure)
+                                if bio_text and bio_text not in bio_parts and len(bio_text) > 5:  # Allow shorter bios
+                                    # Skip if it looks like a question answer (contains bullet points or multiple lines)
+                                    if not (bio_text.count('\n') > 2 or bio_text.count('-') > 2):
+                                        bio_parts.append(bio_text)
                         except:
-                            continue
+                            # If we can't check parent, try to extract anyway but be more selective
+                            try:
+                                bio_text = bio_elem.text.strip()
+                                if bio_text and len(bio_text) > 5 and len(bio_text) < 500:  # Reasonable bio length
+                                    bio_parts.append(bio_text)
+                            except:
+                                continue
                 except NoSuchElementException:
                     continue
+            
             if bio_parts:
-                profile_data["bio"] = '\n'.join(bio_parts)
-                print(f"{CYAN} Extracted bio: {len(bio_parts)} section(s)")
+                # Join and clean up bio
+                bio_text = '\n'.join(bio_parts).strip()
+                profile_data["bio"] = bio_text
+                print(f"{CYAN} Extracted bio: {len(bio_text)} characters")
+            else:
+                # No bio found - this is normal for some profiles
+                profile_data["bio"] = None
+                print(f"{CYAN} No bio found (this is normal for some profiles)")
         except Exception as e:
             print(f"{YELLOW} Error extracting bio: {e}")
             profile_data["bio"] = None
@@ -434,19 +492,37 @@ def extract_profile_data(browser: webdriver.Chrome) -> Optional[Dict]:
             image_urls = []
             seen_urls = set()
             
+            # Filter out badge/icon URLs - these contain specific patterns
+            def is_profile_photo(src):
+                if not src or len(src) < 50:
+                    return False
+                src_lower = src.lower()
+                # Exclude badges, icons, and lifestyle badges
+                if any(exclude in src_lower for exclude in [
+                    'badge', 'icon', 'placeholder', 'lifestyle_badges', 
+                    'profilechips', 'ic_badge', 'sz___size__'
+                ]):
+                    return False
+                # Profile photos are typically in format like:
+                # - //us1.ecdn2.bumbcdn.com/p521/hidden?euri=... (hidden photos)
+                # - //us1.ecdn2.bumbcdn.com/i/big/... (visible photos)
+                # Badge URLs contain: /assets/bumble_lifestyle_badges/
+                if '/assets/bumble_lifestyle_badges/' in src_lower:
+                    return False
+                # Must be from bumbcdn.com or bumble.com
+                if 'bumbcdn.com' not in src and 'bumble.com' not in src:
+                    return False
+                return True
+            
             # First try to get images from the album (main profile images)
             try:
                 album_elem = browser.find_element(By.CSS_SELECTOR, 'article.encounters-album')
                 images = album_elem.find_elements(By.TAG_NAME, 'img')
                 for img in images:
                     src = img.get_attribute('src') or img.get_attribute('data-src')
-                    if src and src not in seen_urls:
-                        # Filter out placeholders, icons, and small images
-                        if 'placeholder' not in src.lower() and 'icon' not in src.lower() and len(src) > 50:
-                            # Bumble images are often in format like "//us1.ecdn2.bumbcdn.com/p519/..."
-                            if 'bumbcdn.com' in src or 'bumble.com' in src:
-                                image_urls.append(src)
-                                seen_urls.add(src)
+                    if src and src not in seen_urls and is_profile_photo(src):
+                        image_urls.append(src)
+                        seen_urls.add(src)
             except:
                 pass
             
@@ -456,13 +532,14 @@ def extract_profile_data(browser: webdriver.Chrome) -> Optional[Dict]:
                     images = browser.find_elements(By.CSS_SELECTOR, selector)
                     for img in images:
                         src = img.get_attribute('src') or img.get_attribute('data-src')
-                        if src and src not in seen_urls:
-                            if 'placeholder' not in src.lower() and 'icon' not in src.lower() and len(src) > 50:
-                                if 'bumbcdn.com' in src or 'bumble.com' in src:
-                                    image_urls.append(src)
-                                    seen_urls.add(src)
+                        if src and src not in seen_urls and is_profile_photo(src):
+                            image_urls.append(src)
+                            seen_urls.add(src)
                 except:
                     continue
+            
+            # Limit to first 3 profile photos
+            image_urls = image_urls[:3]
             
             profile_data["image_urls"] = list(set(image_urls))  # Remove duplicates
             if image_urls:
@@ -472,49 +549,96 @@ def extract_profile_data(browser: webdriver.Chrome) -> Optional[Dict]:
             profile_data["image_urls"] = []
         
         # Extract location/distance - Bumble uses location-widget
+        # HTML structure: .location-widget__town (city) and .location-widget__distance (distance)
         # Search entire page, not just profile_element
         try:
-            location_selectors = [
-                '.location-widget__town',  # Found in HTML: "Denver"
-                '.location-widget__distance',  # Found in HTML: "~3 miles away"
-                '.encounters-story-section--location .location-widget__town',
-                '.encounters-story-section--location .location-widget__distance',
-                '.encounters-story-section--location',
-                '[class*="location-widget"]',
-                '.encounters-story-section__content[class*="location"]',
-            ]
+            # Wait a bit for location section to load
+            time.sleep(1)
             
             location_parts = []
             
-            # Try to find location widget - search entire page
-            for selector in location_selectors:
-                try:
-                    loc_elems = browser.find_elements(By.CSS_SELECTOR, selector)
-                    for loc_elem in loc_elems:
+            # Extract city name
+            try:
+                town_elems = browser.find_elements(By.CSS_SELECTOR, '.location-widget__town')
+                for town_elem in town_elems:
+                    # Try multiple methods to get text
+                    town_text = None
+                    try:
+                        town_text = town_elem.text.strip()
+                    except:
+                        pass
+                    
+                    if not town_text or len(town_text) < 1:
                         try:
-                            # Don't require is_displayed() - elements might be in DOM but not visible
-                            loc_text = loc_elem.text.strip()
-                            if loc_text and loc_text not in location_parts:
-                                location_parts.append(loc_text)
+                            town_text = browser.execute_script("return arguments[0].textContent || arguments[0].innerText || '';", town_elem)
+                            town_text = town_text.strip() if town_text else ''
                         except:
-                            continue
-                except:
-                    continue
+                            pass
+                    
+                    if town_text and town_text not in location_parts:
+                        location_parts.append(town_text)
+                        print(f"{CYAN} Found location town: {town_text}")
+            except Exception as e:
+                print(f"{YELLOW} Error finding town: {e}")
+            
+            # Extract distance
+            try:
+                distance_elems = browser.find_elements(By.CSS_SELECTOR, '.location-widget__distance')
+                for distance_elem in distance_elems:
+                    # Try multiple methods to get text
+                    distance_text = None
+                    try:
+                        distance_text = distance_elem.text.strip()
+                    except:
+                        pass
+                    
+                    if not distance_text or len(distance_text) < 1:
+                        try:
+                            distance_text = browser.execute_script("return arguments[0].textContent || arguments[0].innerText || '';", distance_elem)
+                            distance_text = distance_text.strip() if distance_text else ''
+                        except:
+                            pass
+                    
+                    if distance_text and distance_text not in location_parts:
+                        location_parts.append(distance_text)
+                        print(f"{CYAN} Found location distance: {distance_text}")
+            except Exception as e:
+                print(f"{YELLOW} Error finding distance: {e}")
+            
+            # Fallback: try other selectors
+            if not location_parts:
+                location_selectors = [
+                    '.encounters-story-section--location .location-widget__town',
+                    '.encounters-story-section--location .location-widget__distance',
+                    '[class*="location-widget"]',
+                ]
+                
+                for selector in location_selectors:
+                    try:
+                        loc_elems = browser.find_elements(By.CSS_SELECTOR, selector)
+                        for loc_elem in loc_elems:
+                            try:
+                                loc_text = loc_elem.text.strip()
+                                if not loc_text:
+                                    loc_text = browser.execute_script("return arguments[0].textContent || arguments[0].innerText || '';", loc_elem)
+                                    loc_text = loc_text.strip() if loc_text else ''
+                                if loc_text and loc_text not in location_parts:
+                                    location_parts.append(loc_text)
+                            except:
+                                continue
+                    except:
+                        continue
             
             if location_parts:
                 profile_data["location"] = ' | '.join(location_parts)
                 print(f"{CYAN} Extracted location: {profile_data['location']}")
             else:
-                # Fallback: search for location patterns in text
-                import re
-                article_text = profile_element.text
-                # Look for "miles away" or city patterns
-                location_pattern = r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s*~?\s*(\d+)\s*miles?\s*away'
-                match = re.search(location_pattern, article_text, re.I)
-                if match:
-                    profile_data["location"] = f"{match.group(1)} | {match.group(2)} miles away"
+                profile_data["location"] = None
+                print(f"{CYAN} No location found")
         except Exception as e:
             print(f"{YELLOW} Error extracting location: {e}")
+            import traceback
+            traceback.print_exc()
             profile_data["location"] = None
         
         # Extract preferences (looking for) - from badges/pills
@@ -589,13 +713,16 @@ def extract_profile_data(browser: webdriver.Chrome) -> Optional[Dict]:
         
         # Extract ALL badges/pills (height, exercise, education, gender, intentions, family plans, politics, etc.)
         # Search entire page, not just profile_element
+        # Badges are in .encounters-story-about__badge within the About section
         try:
+            # Wait a bit for badges to load
+            time.sleep(1)
+            
             badge_selectors = [
-                '.encounters-story-about__badge .pill__title',  # Badge titles
-                '.encounters-story-about__badge',
+                '.encounters-story-about__badge .pill__title',  # Primary: badge titles in About section
+                '.encounters-story-section--about .pill__title',  # Alternative
+                '.encounters-story-about__badge',  # Fallback
                 '.pill[data-qa-role="pill"] .pill__title',
-                '.pill[data-qa-role="pill"]',
-                '[class*="badge"]',
             ]
             
             all_badges = []
@@ -603,13 +730,45 @@ def extract_profile_data(browser: webdriver.Chrome) -> Optional[Dict]:
             for selector in badge_selectors:
                 try:
                     badges = browser.find_elements(By.CSS_SELECTOR, selector)
+                    print(f"{CYAN} Found {len(badges)} badge elements with selector: {selector}")
                     for badge in badges:
                         try:
-                            # Don't require is_displayed() - elements might be in DOM but not visible
-                            badge_text = badge.text.strip()
+                            # Try multiple methods to get badge text
+                            badge_text = None
+                            
+                            # Method 1: Direct text property
+                            try:
+                                badge_text = badge.text.strip()
+                            except:
+                                pass
+                            
+                            # Method 2: JavaScript textContent (more reliable)
+                            if not badge_text or len(badge_text) < 1:
+                                try:
+                                    badge_text = browser.execute_script("return arguments[0].textContent || arguments[0].innerText || '';", badge)
+                                    if badge_text:
+                                        # Handle encoding issues with emojis
+                                        badge_text = badge_text.encode('utf-8', errors='ignore').decode('utf-8', errors='ignore').strip()
+                                except:
+                                    pass
+                            
+                            # Method 3: Try nested div with p-3 class
+                            if not badge_text or len(badge_text) < 1:
+                                try:
+                                    nested_div = badge.find_element(By.CSS_SELECTOR, 'div.p-3, div[class*="p-3"], div')
+                                    badge_text = nested_div.text.strip() if nested_div else ''
+                                    if not badge_text:
+                                        badge_text = browser.execute_script("return arguments[0].textContent || arguments[0].innerText || '';", nested_div)
+                                        badge_text = badge_text.strip() if badge_text else ''
+                                except:
+                                    pass
                             
                             # Skip if it's an image URL or empty
                             if not badge_text or badge_text.startswith('http') or len(badge_text) < 1:
+                                continue
+                            
+                            # Skip if it's just whitespace or very short
+                            if len(badge_text) < 2:
                                 continue
                             
                             # Normalize and deduplicate
@@ -617,45 +776,93 @@ def extract_profile_data(browser: webdriver.Chrome) -> Optional[Dict]:
                             if badge_lower not in seen_badges:
                                 seen_badges.add(badge_lower)
                                 all_badges.append(badge_text)
-                        except:
+                                print(f"{CYAN}   Added badge: {badge_text}")
+                        except Exception as e:
+                            print(f"{YELLOW}   Error processing badge: {e}")
                             continue
-                except:
+                except Exception as e:
+                    print(f"{YELLOW} Error with selector {selector}: {e}")
                     continue
             
             if all_badges:
                 profile_data["badges"] = all_badges
                 print(f"{CYAN} Extracted {len(all_badges)} badge(s): {', '.join(all_badges[:5])}{'...' if len(all_badges) > 5 else ''}")
+            else:
+                profile_data["badges"] = []
+                print(f"{YELLOW} No badges found")
         except Exception as e:
             print(f"{YELLOW} Error extracting badges: {e}")
+            import traceback
+            traceback.print_exc()
             profile_data["badges"] = []
         
-        # Extract question answers (e.g., "I'm a real nerd about", "My ultimate green flag is")
+        # Extract question answers (e.g., "Two truths and a lie", "My simple pleasures are")
         # Search entire page, not just profile_element
         try:
+            # Wait a bit for question sections to load
+            time.sleep(1)
+            
             question_sections = browser.find_elements(By.CSS_SELECTOR, '.encounters-story-section--question')
+            print(f"{CYAN} Found {len(question_sections)} question section(s)")
             questions_answers = {}
             
-            for section in question_sections:
+            for i, section in enumerate(question_sections):
                 try:
-                    # Don't require is_displayed() - elements might be in DOM but not visible
-                    # Get question title
-                    question_title_elem = section.find_element(By.CSS_SELECTOR, '.encounters-story-section__heading-title h2')
-                    question_title = question_title_elem.text.strip() if question_title_elem else None
+                    # Get question title - try multiple methods
+                    question_title = None
+                    try:
+                        question_title_elem = section.find_element(By.CSS_SELECTOR, '.encounters-story-section__heading-title h2')
+                        question_title = question_title_elem.text.strip() if question_title_elem else None
+                        if not question_title:
+                            question_title = browser.execute_script("return arguments[0].textContent || arguments[0].innerText || '';", question_title_elem)
+                            question_title = question_title.strip() if question_title else None
+                    except:
+                        # Try alternative selector
+                        try:
+                            question_title_elem = section.find_element(By.CSS_SELECTOR, '.encounters-story-section__heading-title')
+                            question_title = question_title_elem.text.strip() if question_title_elem else None
+                            if not question_title:
+                                question_title = browser.execute_script("return arguments[0].textContent || arguments[0].innerText || '';", question_title_elem)
+                                question_title = question_title.strip() if question_title else None
+                        except:
+                            pass
                     
-                    # Get answer text
-                    answer_elem = section.find_element(By.CSS_SELECTOR, '.encounters-story-about__text')
-                    answer_text = answer_elem.text.strip() if answer_elem else None
+                    # Get answer text - try multiple methods
+                    answer_text = None
+                    try:
+                        answer_elem = section.find_element(By.CSS_SELECTOR, '.encounters-story-about__text')
+                        answer_text = answer_elem.text.strip() if answer_elem else None
+                        if not answer_text:
+                            answer_text = browser.execute_script("return arguments[0].textContent || arguments[0].innerText || '';", answer_elem)
+                            answer_text = answer_text.strip() if answer_text else None
+                    except:
+                        # Try alternative selector
+                        try:
+                            answer_elem = section.find_element(By.CSS_SELECTOR, '.encounters-story-section__content p, .encounters-story-section__content')
+                            answer_text = answer_elem.text.strip() if answer_elem else None
+                            if not answer_text:
+                                answer_text = browser.execute_script("return arguments[0].textContent || arguments[0].innerText || '';", answer_elem)
+                                answer_text = answer_text.strip() if answer_text else None
+                        except:
+                            pass
                     
                     if question_title and answer_text:
                         questions_answers[question_title] = answer_text
-                except:
+                        print(f"{CYAN}   Extracted Q&A: {question_title[:40]}...")
+                except Exception as e:
+                    print(f"{YELLOW}   Error processing question section {i}: {e}")
                     continue
             
             if questions_answers:
                 profile_data["question_answers"] = questions_answers
                 print(f"{CYAN} Extracted {len(questions_answers)} question answer(s)")
+            else:
+                profile_data["question_answers"] = {}
+                print(f"{CYAN} No question answers found")
         except Exception as e:
             print(f"{YELLOW} Error extracting question answers: {e}")
+            import traceback
+            traceback.print_exc()
             profile_data["question_answers"] = {}
         
         # Extract Spotify artists - search entire page
@@ -680,26 +887,99 @@ def extract_profile_data(browser: webdriver.Chrome) -> Optional[Dict]:
             print(f"{YELLOW} Error extracting Spotify artists: {e}")
             profile_data["spotify_artists"] = []
         
-        # Extract "From" location (e.g., "🇺🇸 From Laguna Hills, CA")
+        # Extract "From" location (e.g., "🇺🇸 Lives in Denver, CO")
+        # HTML structure: .location-widget__pill .pill__title
         # Search entire page
         try:
-            location_pills = browser.find_elements(By.CSS_SELECTOR, '.location-widget__pill .pill__title')
-            from_locations = []
+            from_location_selectors = [
+                '.location-widget__pill .pill__title',  # Found in HTML
+                '.encounters-story-section--location .location-widget__pill .pill__title',
+                '.location-widget__info .pill__title',
+                '.location-widget__pill .pill__title div',  # Nested structure
+            ]
             
-            for pill in location_pills:
+            from_locations = []
+            for selector in from_location_selectors:
                 try:
-                    # Don't require is_displayed() - elements might be in DOM but not visible
-                    pill_text = pill.text.strip()
-                    if 'from' in pill_text.lower() or '🇺🇸' in pill_text or '🇬🇧' in pill_text or '🇨🇦' in pill_text:
-                        from_locations.append(pill_text)
-                except:
+                    pills = browser.find_elements(By.CSS_SELECTOR, selector)
+                    print(f"{CYAN} Found {len(pills)} pill(s) with selector: {selector}")
+                    for pill in pills:
+                        try:
+                            # Try multiple methods to get text
+                            pill_text = None
+                            
+                            # Method 1: Direct text property
+                            try:
+                                pill_text = pill.text.strip()
+                            except:
+                                pass
+                            
+                            # Method 2: JavaScript textContent
+                            if not pill_text or len(pill_text) < 1:
+                                try:
+                                    pill_text = browser.execute_script("return arguments[0].textContent || arguments[0].innerText || '';", pill)
+                                    if pill_text:
+                                        # Handle encoding issues with emojis
+                                        pill_text = pill_text.encode('utf-8', errors='ignore').decode('utf-8', errors='ignore').strip()
+                                except:
+                                    pass
+                            
+                            # Method 3: Try nested div
+                            if not pill_text or len(pill_text) < 1:
+                                try:
+                                    nested_div = pill.find_element(By.CSS_SELECTOR, 'div.p-3, div[class*="p-3"], div')
+                                    pill_text = nested_div.text.strip() if nested_div else ''
+                                    if not pill_text:
+                                        pill_text = browser.execute_script("return arguments[0].textContent || arguments[0].innerText || '';", nested_div)
+                                        if pill_text:
+                                            # Handle encoding issues with emojis
+                                            pill_text = pill_text.encode('utf-8', errors='ignore').decode('utf-8', errors='ignore').strip()
+                                except:
+                                    pass
+                            
+                            # Check for location indicators (flags, "Lives in", "From")
+                            if pill_text and any(indicator in pill_text.lower() for indicator in ['lives in', 'from', '🇺🇸', '🇬🇧', '🇨🇦', '🇲🇽', '🇦🇺']):
+                                from_locations.append(pill_text)
+                                print(f"{CYAN} Found from location: {pill_text}")
+                        except Exception as e:
+                            print(f"{YELLOW} Error processing pill: {e}")
+                            continue
+                    if from_locations:
+                        break
+                except Exception as e:
+                    print(f"{YELLOW} Error with selector {selector}: {e}")
                     continue
             
+            # Also check badges for location info (sometimes it's there)
+            # This is more reliable since badges are already extracted with proper encoding
+            # Check badges even if direct extraction found something, to ensure we get the best match
+            if profile_data.get("badges"):
+                for badge in profile_data["badges"]:
+                    badge_lower = badge.lower()
+                    # Look for "from" location (not "lives in")
+                    if 'from' in badge_lower and 'lives in' not in badge_lower:
+                        from_locations.append(badge)
+                        print(f"{CYAN} Found from location in badges: {badge}")
+                        break  # Take first "From" location found
+            
             if from_locations:
-                profile_data["from_location"] = from_locations[0]  # Usually just one
+                # Prefer "From" over "Lives in" if both exist
+                from_location = None
+                for loc in from_locations:
+                    if 'from' in loc.lower() and 'lives in' not in loc.lower():
+                        from_location = loc
+                        break
+                if not from_location:
+                    from_location = from_locations[0]
+                profile_data["from_location"] = from_location
                 print(f"{CYAN} Extracted from location: {profile_data['from_location']}")
+            else:
+                profile_data["from_location"] = None
+                print(f"{CYAN} No from location found")
         except Exception as e:
             print(f"{YELLOW} Error extracting from location: {e}")
+            import traceback
+            traceback.print_exc()
             profile_data["from_location"] = None
         
         # Extract job from encounters-story-profile__occupation if not already found
@@ -1114,7 +1394,7 @@ def set_location(browser: webdriver.Chrome, location: str) -> bool:
 
 def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1.5,
                     output_format: str = 'json', output_file: str = None, headless: bool = True,
-                    location: str = None, no_swipe: bool = False):
+                    location: str = None, no_swipe: bool = False, keep_browser_open: bool = False):
     """
     Scrape Bumble profiles by extracting data before swiping right.
     
@@ -1280,11 +1560,13 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
             except Exception as e:
                 print(f"{YELLOW} Error navigating: {e}")
         
-        # Set location if provided
+        # NOTE: We don't set location via geolocation anymore
+        # Location is extracted from the actual HTML shown in the profile
+        # Setting geolocation doesn't reliably change what profiles Bumble shows
+        # The location in the profile HTML is what we extract and use
         if location:
-            set_location(browser, location)
-            # Wait a bit after setting location
-            time.sleep(3)
+            print(f"{CYAN} Note: Location parameter '{location}' provided, but we extract actual location from profile HTML")
+            print(f"{CYAN} The location shown in profiles may differ from the parameter (this is expected)")
         
         # Save HTML for debugging (first time)
         try:
@@ -1381,7 +1663,13 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
                 profile_count += 1
             
             # Swipe right after extraction (unless --no-swipe is set)
-            if not no_swipe:
+            if no_swipe:
+                # In no-swipe mode, we can't see the next profile without swiping
+                # So we break after extracting the current profile
+                print(f"{CYAN} No-swipe mode: Extracted profile {profile_count}, stopping (cannot see next profile without swiping)")
+                break
+            else:
+                # Swipe right to see next profile
                 print(f"{CYAN} Swiping right on profile {profile_count}...")
                 swipe_success = swipe_right(browser)
                 
@@ -1401,11 +1689,6 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
                 
                 # Wait a bit more for new profile to load
                 time.sleep(1)
-            else:
-                # In no-swipe mode, we can't see the next profile without swiping
-                # So we break after extracting the current profile
-                print(f"{CYAN} No-swipe mode: Extracted profile {profile_count}, stopping (cannot see next profile without swiping)")
-                break
         
         # Save all profiles
         if not all_profiles:
@@ -1483,8 +1766,19 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
         sys.exit(1)
     finally:
         if browser:
-            print(f"{CYAN} Closing browser...")
-            browser.quit()
+            if keep_browser_open:
+                print(f"{CYAN} Keeping browser open for debugging (use --keep-browser-open to auto-close)")
+                print(f"{CYAN} Browser will remain open. Press Ctrl+C or close manually when done.")
+                try:
+                    # Wait indefinitely until user closes or interrupts
+                    while True:
+                        time.sleep(1)
+                except KeyboardInterrupt:
+                    print(f"\n{CYAN} Closing browser...")
+                    browser.quit()
+            else:
+                print(f"{CYAN} Closing browser...")
+                browser.quit()
 
 
 def main():
@@ -1507,6 +1801,8 @@ def main():
                         help='Set location filter (e.g., "Seattle" or "Seattle, WA")')
     parser.add_argument('--no-swipe', dest='no_swipe', action='store_true', default=False,
                         help='Extract profile data without swiping (useful for testing/inspection)')
+    parser.add_argument('--keep-browser-open', dest='keep_browser_open', action='store_true', default=False,
+                        help='Keep browser open after scraping completes (useful for debugging)')
     
     args = parser.parse_args()
     
@@ -1523,7 +1819,8 @@ def main():
         output_file=args.output,
         headless=args.headless,
         location=args.location,
-        no_swipe=args.no_swipe
+        no_swipe=args.no_swipe,
+        keep_browser_open=args.keep_browser_open
     )
 
 
