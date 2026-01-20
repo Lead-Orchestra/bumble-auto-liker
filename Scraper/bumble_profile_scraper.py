@@ -13,6 +13,7 @@ import argparse
 import os
 import time
 import random
+import re
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Optional
@@ -21,6 +22,7 @@ try:
     import undetected_chromedriver as uc
     from selenium import webdriver
     from selenium.webdriver.common.by import By
+    from selenium.webdriver.common.keys import Keys
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
     from selenium.common.exceptions import TimeoutException, NoSuchElementException, ElementNotInteractableException
@@ -724,8 +726,252 @@ def handle_match_popup(browser: webdriver.Chrome) -> bool:
         return False
 
 
+def set_location_geolocation(browser: webdriver.Chrome, location: str) -> bool:
+    """
+    Set location using browser geolocation API (alternative method).
+    Uses geocoding to get coordinates for the location, then sets browser geolocation.
+    
+    Args:
+        browser: Selenium WebDriver instance
+        location: Location string (e.g., "Seattle" or "Seattle, WA")
+    
+    Returns:
+        True if geolocation was set successfully, False otherwise
+    """
+    try:
+        print(f"{CYAN} Attempting to set location via geolocation API: {location}")
+        
+        # Common coordinates for major cities (fallback if geocoding fails)
+        city_coordinates = {
+            'seattle': {'latitude': 47.6062, 'longitude': -122.3321},
+            'seattle, wa': {'latitude': 47.6062, 'longitude': -122.3321},
+            'seattle, washington': {'latitude': 47.6062, 'longitude': -122.3321},
+            'new york': {'latitude': 40.7128, 'longitude': -74.0060},
+            'new york, ny': {'latitude': 40.7128, 'longitude': -74.0060},
+            'los angeles': {'latitude': 34.0522, 'longitude': -118.2437},
+            'los angeles, ca': {'latitude': 34.0522, 'longitude': -118.2437},
+            'chicago': {'latitude': 41.8781, 'longitude': -87.6298},
+            'chicago, il': {'latitude': 41.8781, 'longitude': -87.6298},
+            'san francisco': {'latitude': 37.7749, 'longitude': -122.4194},
+            'san francisco, ca': {'latitude': 37.7749, 'longitude': -122.4194},
+            'denver': {'latitude': 39.7392, 'longitude': -104.9903},
+            'denver, co': {'latitude': 39.7392, 'longitude': -104.9903},
+            'austin': {'latitude': 30.2672, 'longitude': -97.7431},
+            'austin, tx': {'latitude': 30.2672, 'longitude': -97.7431},
+            'miami': {'latitude': 25.7617, 'longitude': -80.1918},
+            'miami, fl': {'latitude': 25.7617, 'longitude': -80.1918},
+        }
+        
+        location_lower = location.lower().strip()
+        coords = city_coordinates.get(location_lower)
+        
+        if not coords:
+            # Try to extract city name (remove state/country)
+            city_name = location.split(',')[0].strip().lower()
+            coords = city_coordinates.get(city_name)
+            
+            if not coords:
+                print(f"{YELLOW} Location '{location}' not in predefined list.")
+                print(f"{YELLOW} Supported cities: Seattle, New York, Los Angeles, Chicago, San Francisco, Denver, Austin, Miami")
+                print(f"{YELLOW} Using Seattle coordinates as fallback. For other cities, add coordinates to city_coordinates dict.")
+                coords = {'latitude': 47.6062, 'longitude': -122.3321}
+        
+        # Set geolocation using Chrome DevTools Protocol
+        print(f"{CYAN} Setting geolocation to: {coords['latitude']}, {coords['longitude']}")
+        browser.execute_cdp_cmd('Emulation.setGeolocationOverride', {
+            'latitude': coords['latitude'],
+            'longitude': coords['longitude'],
+            'accuracy': 100
+        })
+        
+        print(f"{GREEN} Geolocation set successfully")
+        return True
+        
+    except Exception as e:
+        print(f"{YELLOW} Error setting geolocation: {e}")
+        return False
+
+
+def set_location(browser: webdriver.Chrome, location: str) -> bool:
+    """
+    Set location filter in Bumble by navigating to settings and updating location.
+    Tries multiple methods: settings UI, filters UI, and browser geolocation API.
+    
+    Args:
+        browser: Selenium WebDriver instance
+        location: Location string (e.g., "Seattle" or "Seattle, WA")
+    
+    Returns:
+        True if location was set successfully, False otherwise
+    """
+    try:
+        print(f"{CYAN} Setting location to: {location}")
+        
+        # First, try setting via geolocation API (most reliable)
+        if set_location_geolocation(browser, location):
+            print(f"{CYAN} Location set via geolocation API, refreshing page...")
+            browser.refresh()
+            time.sleep(3)
+            return True
+        
+        # Navigate to settings page
+        # Bumble settings are typically at /app/settings or accessible via a settings button
+        print(f"{CYAN} Navigating to Bumble settings...")
+        
+        # Try multiple ways to access settings:
+        # 1. Direct URL
+        settings_urls = [
+            "https://www.bumble.com/app/settings",
+            "https://app.bumble.com/settings",
+            "https://www.bumble.com/app/preferences",
+        ]
+        
+        settings_accessed = False
+        for url in settings_urls:
+            try:
+                browser.get(url)
+                time.sleep(3)
+                if 'settings' in browser.current_url.lower() or 'preferences' in browser.current_url.lower():
+                    print(f"{GREEN} Accessed settings page: {browser.current_url}")
+                    settings_accessed = True
+                    break
+            except:
+                continue
+        
+        if not settings_accessed:
+            # Try to find settings button on main page
+            print(f"{CYAN} Trying to find settings button on main page...")
+            try:
+                # Look for settings/gear icon button
+                settings_selectors = [
+                    'button[aria-label*="Settings"]',
+                    'button[aria-label*="settings"]',
+                    'a[href*="settings"]',
+                    'button[class*="settings"]',
+                    '[data-testid*="settings"]',
+                    'svg[class*="settings"]',
+                    '.settings-button',
+                ]
+                
+                for selector in settings_selectors:
+                    try:
+                        settings_btn = browser.find_element(By.CSS_SELECTOR, selector)
+                        if settings_btn.is_displayed():
+                            settings_btn.click()
+                            time.sleep(3)
+                            settings_accessed = True
+                            print(f"{GREEN} Clicked settings button")
+                            break
+                    except:
+                        continue
+            except:
+                pass
+        
+        if not settings_accessed:
+            print(f"{YELLOW} Could not access settings page, trying to set location via filters...")
+            # Try to access filters directly
+            try:
+                # Look for filter button
+                filter_selectors = [
+                    'button[aria-label*="Filter"]',
+                    'button[aria-label*="filter"]',
+                    'button[class*="filter"]',
+                    '[data-testid*="filter"]',
+                ]
+                
+                for selector in filter_selectors:
+                    try:
+                        filter_btn = browser.find_element(By.CSS_SELECTOR, selector)
+                        if filter_btn.is_displayed():
+                            filter_btn.click()
+                            time.sleep(2)
+                            print(f"{GREEN} Opened filters")
+                            break
+                    except:
+                        continue
+            except:
+                pass
+        
+        # Try to find location input/selector
+        print(f"{CYAN} Looking for location input field...")
+        location_selectors = [
+            'input[placeholder*="location" i]',
+            'input[placeholder*="city" i]',
+            'input[name*="location" i]',
+            'input[id*="location" i]',
+            'input[type="text"][class*="location"]',
+            'select[name*="location" i]',
+            'select[id*="location" i]',
+        ]
+        
+        location_set = False
+        for selector in location_selectors:
+            try:
+                location_input = browser.find_element(By.CSS_SELECTOR, selector)
+                if location_input.is_displayed():
+                    print(f"{GREEN} Found location input: {selector}")
+                    # Clear and set location
+                    location_input.clear()
+                    location_input.send_keys(location)
+                    time.sleep(1)
+                    
+                    # Try to submit or select from dropdown
+                    location_input.send_keys(Keys.RETURN)
+                    time.sleep(2)
+                    
+                    # Look for save/apply button
+                    save_selectors = [
+                        'button[type="submit"]',
+                        'button[class*="save"]',
+                        'button[class*="apply"]',
+                        'button[aria-label*="Save" i]',
+                        'button[aria-label*="Apply" i]',
+                    ]
+                    
+                    for save_selector in save_selectors:
+                        try:
+                            save_btn = browser.find_element(By.CSS_SELECTOR, save_selector)
+                            if save_btn.is_displayed():
+                                save_btn.click()
+                                time.sleep(2)
+                                print(f"{GREEN} Clicked save/apply button")
+                                break
+                        except:
+                            continue
+                    
+                    location_set = True
+                    break
+            except:
+                continue
+        
+        if location_set:
+            print(f"{GREEN} Location set to: {location}")
+            # Navigate back to app page
+            browser.get("https://www.bumble.com/app")
+            time.sleep(3)
+            return True
+        else:
+            print(f"{YELLOW} Could not find location input field. Location may need to be set manually in Bumble settings.")
+            print(f"{YELLOW} Note: Bumble may use browser geolocation or require manual location setting.")
+            # Navigate back to app page
+            browser.get("https://www.bumble.com/app")
+            time.sleep(3)
+            return False
+            
+    except Exception as e:
+        print(f"{YELLOW} Error setting location: {e}")
+        # Navigate back to app page
+        try:
+            browser.get("https://www.bumble.com/app")
+            time.sleep(3)
+        except:
+            pass
+        return False
+
+
 def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1.5,
-                    output_format: str = 'json', output_file: str = None, headless: bool = True):
+                    output_format: str = 'json', output_file: str = None, headless: bool = True,
+                    location: str = None):
     """
     Scrape Bumble profiles by extracting data before swiping right.
     
@@ -736,6 +982,7 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
         output_format: Output format ('json' or 'csv')
         output_file: Output file path (optional, auto-generated if not provided)
         headless: Run browser in headless mode (default: True - recommended for automation)
+        location: Location to set (e.g., "Seattle" or "Seattle, WA") - optional
     """
     browser = None
     try:
@@ -743,18 +990,98 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
         print(f"{CYAN} Mode: Extract profile data BEFORE swiping right")
         print(f"{CYAN} Headless: {headless}")
         
-        # Set up Chrome options
-        options = uc.ChromeOptions()
-        if headless:
-            options.add_argument('--headless=new')
-        options.add_argument('--no-sandbox')
-        options.add_argument('--disable-dev-shm-usage')
-        options.add_argument('--disable-blink-features=AutomationControlled')
-        options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+        def create_chrome_options():
+            """Create a new ChromeOptions object (cannot be reused)"""
+            options = uc.ChromeOptions()
+            if headless:
+                options.add_argument('--headless=new')
+            options.add_argument('--no-sandbox')
+            options.add_argument('--disable-dev-shm-usage')
+            options.add_argument('--disable-blink-features=AutomationControlled')
+            options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+            return options
         
         # Create undetected Chrome driver (undetected-chromedriver handles anti-detection automatically)
+        # Let undetected-chromedriver auto-detect and download the correct ChromeDriver version
         print(f"{CYAN} Starting browser...")
-        browser = uc.Chrome(options=options, version_main=None, headless=headless)
+        print(f"{CYAN} Auto-detecting Chrome version and downloading compatible ChromeDriver...")
+        
+        # Try to detect Chrome version first to ensure we get the right ChromeDriver
+        chrome_version = None
+        try:
+            import subprocess
+            if sys.platform == 'win32':
+                # Windows: Check registry for Chrome version
+                try:
+                    result = subprocess.run(
+                        ['reg', 'query', 'HKEY_CURRENT_USER\\Software\\Google\\Chrome\\BLBeacon', '/v', 'version'],
+                        capture_output=True, text=True, timeout=5
+                    )
+                    if result.returncode == 0:
+                        match = re.search(r'version\s+REG_SZ\s+(\d+)', result.stdout)
+                        if match:
+                            chrome_version = int(match.group(1))
+                            print(f"{CYAN} Detected Chrome version: {chrome_version}")
+                except Exception as e:
+                    print(f"{YELLOW} Could not detect Chrome version from registry: {e}")
+                    # Try alternative method: check Chrome executable
+                    try:
+                        chrome_paths = [
+                            os.path.expanduser('~\\AppData\\Local\\Google\\Chrome\\Application\\chrome.exe'),
+                            'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+                            'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+                        ]
+                        for chrome_path in chrome_paths:
+                            if os.path.exists(chrome_path):
+                                result = subprocess.run(
+                                    [chrome_path, '--version'],
+                                    capture_output=True, text=True, timeout=5
+                                )
+                                if result.returncode == 0:
+                                    match = re.search(r'(\d+)\.', result.stdout)
+                                    if match:
+                                        chrome_version = int(match.group(1))
+                                        print(f"{CYAN} Detected Chrome version from executable: {chrome_version}")
+                                        break
+                    except:
+                        pass
+        except Exception as e:
+            print(f"{YELLOW} Could not detect Chrome version: {e}")
+        
+        # Try to initialize browser with detected version or auto-detection
+        browser = None
+        try:
+            if chrome_version:
+                print(f"{CYAN} Using detected Chrome version: {chrome_version}")
+                options = create_chrome_options()
+                browser = uc.Chrome(options=options, version_main=chrome_version, headless=headless, use_subprocess=True)
+            else:
+                print(f"{CYAN} Using auto-detection for Chrome version...")
+                options = create_chrome_options()
+                browser = uc.Chrome(options=options, version_main=None, headless=headless, use_subprocess=True)
+        except Exception as e:
+            error_msg = str(e)
+            print(f"{YELLOW} Initial browser initialization failed: {error_msg[:300]}")
+            
+            # If version mismatch error, try to extract version from error and retry
+            if 'Chrome version' in error_msg or 'ChromeDriver only supports' in error_msg:
+                print(f"{CYAN} Attempting to fix ChromeDriver version mismatch...")
+                # Extract the actual Chrome version from the error message
+                match = re.search(r'Current browser version is (\d+)\.', error_msg)
+                if match:
+                    actual_chrome_version = int(match.group(1))
+                    print(f"{CYAN} Detected actual Chrome version from error: {actual_chrome_version}")
+                    if actual_chrome_version != chrome_version:
+                        chrome_version = actual_chrome_version
+                        print(f"{CYAN} Retrying with correct Chrome version: {chrome_version}")
+                        options = create_chrome_options()
+                        browser = uc.Chrome(options=options, version_main=chrome_version, headless=headless, use_subprocess=True)
+                    else:
+                        raise
+                else:
+                    raise
+            else:
+                raise
         browser.maximize_window()
         
         # Execute script to hide webdriver property
@@ -805,6 +1132,12 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
                 print(f"{CYAN} Page title: {browser.title}")
             except Exception as e:
                 print(f"{YELLOW} Error navigating: {e}")
+        
+        # Set location if provided
+        if location:
+            set_location(browser, location)
+            # Wait a bit after setting location
+            time.sleep(3)
         
         # Save HTML for debugging (first time)
         try:
@@ -998,19 +1331,19 @@ def main():
                         help='Output format (default: json)')
     parser.add_argument('--output', '-o',
                         help='Output file path (optional, auto-generated if not provided)')
-    parser.add_argument('--headless', action='store_true', default=False,
-                        help='Run in headless mode (default: False - shows browser for debugging)')
+    parser.add_argument('--headless', action='store_true', default=None,
+                        help='Run in headless mode (default: True for automation)')
     parser.add_argument('--no-headless', dest='headless', action='store_false',
-                        help='Disable headless mode (show browser window) - this is the default')
+                        help='Disable headless mode (show browser window for debugging)')
+    parser.add_argument('--location', type=str, default=None,
+                        help='Set location filter (e.g., "Seattle" or "Seattle, WA")')
     
     args = parser.parse_args()
     
     # Default to headless=True unless explicitly disabled
-    # Check if --no-headless is in args, if not, default to headless
-    if '--no-headless' not in sys.argv and '--headless' not in sys.argv:
+    # If neither flag is provided, default to headless mode
+    if args.headless is None:
         args.headless = True  # Default to headless for automation
-    elif '--no-headless' in sys.argv:
-        args.headless = False
     
     scrape_profiles(
         cookie_file=args.cookie_file,
@@ -1018,7 +1351,8 @@ def main():
         delay=args.delay,
         output_format=args.format,
         output_file=args.output,
-        headless=args.headless
+        headless=args.headless,
+        location=args.location
     )
 
 
