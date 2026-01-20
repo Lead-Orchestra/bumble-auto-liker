@@ -162,6 +162,9 @@ def extract_profile_data(browser: webdriver.Chrome) -> Optional[Dict]:
         print(f"{CYAN} Attempting to extract profile data...")
         print(f"{CYAN} Current URL: {browser.current_url}")
         
+        # Wait a bit for all profile sections to load (bio, questions, location, Spotify, etc.)
+        time.sleep(2)
+        
         # Save current HTML for debugging
         try:
             with open('bumble_profile_debug.html', 'w', encoding='utf-8') as f:
@@ -313,9 +316,11 @@ def extract_profile_data(browser: webdriver.Chrome) -> Optional[Dict]:
                 profile_data["age"] = None
         
         # Extract bio/description - Bumble uses encounters-story-about__text
+        # Search entire page, not just profile_element, as bio is in encounters-story sections
         try:
             bio_selectors = [
                 '.encounters-story-about__text',  # Found in HTML
+                '.encounters-story-section--about .encounters-story-about__text',
                 '.encounters-story-section__content p',
                 '.encounters-story-about',
                 '[class*="story-about"]',
@@ -325,11 +330,16 @@ def extract_profile_data(browser: webdriver.Chrome) -> Optional[Dict]:
             bio_parts = []
             for selector in bio_selectors:
                 try:
-                    bio_elems = profile_element.find_elements(By.CSS_SELECTOR, selector)
+                    # Search entire page, not just profile_element
+                    bio_elems = browser.find_elements(By.CSS_SELECTOR, selector)
                     for bio_elem in bio_elems:
-                        bio_text = bio_elem.text.strip()
-                        if bio_text and bio_text not in bio_parts:
-                            bio_parts.append(bio_text)
+                        try:
+                            # Don't require is_displayed() - elements might be in DOM but not visible in headless
+                            bio_text = bio_elem.text.strip()
+                            if bio_text and bio_text not in bio_parts and len(bio_text) > 10:  # Filter short text
+                                bio_parts.append(bio_text)
+                        except:
+                            continue
                 except NoSuchElementException:
                     continue
             if bio_parts:
@@ -462,10 +472,13 @@ def extract_profile_data(browser: webdriver.Chrome) -> Optional[Dict]:
             profile_data["image_urls"] = []
         
         # Extract location/distance - Bumble uses location-widget
+        # Search entire page, not just profile_element
         try:
             location_selectors = [
                 '.location-widget__town',  # Found in HTML: "Denver"
                 '.location-widget__distance',  # Found in HTML: "~3 miles away"
+                '.encounters-story-section--location .location-widget__town',
+                '.encounters-story-section--location .location-widget__distance',
                 '.encounters-story-section--location',
                 '[class*="location-widget"]',
                 '.encounters-story-section__content[class*="location"]',
@@ -473,14 +486,18 @@ def extract_profile_data(browser: webdriver.Chrome) -> Optional[Dict]:
             
             location_parts = []
             
-            # Try to find location widget
+            # Try to find location widget - search entire page
             for selector in location_selectors:
                 try:
                     loc_elems = browser.find_elements(By.CSS_SELECTOR, selector)
                     for loc_elem in loc_elems:
-                        loc_text = loc_elem.text.strip()
-                        if loc_text and loc_text not in location_parts:
-                            location_parts.append(loc_text)
+                        try:
+                            # Don't require is_displayed() - elements might be in DOM but not visible
+                            loc_text = loc_elem.text.strip()
+                            if loc_text and loc_text not in location_parts:
+                                location_parts.append(loc_text)
+                        except:
+                            continue
                 except:
                     continue
             
@@ -568,6 +585,132 @@ def extract_profile_data(browser: webdriver.Chrome) -> Optional[Dict]:
                     profile_data["name"] = match.group(1).strip()
                     print(f"{CYAN} Extracted name from fallback: {profile_data['name']}")
             except Exception:
+                pass
+        
+        # Extract ALL badges/pills (height, exercise, education, gender, intentions, family plans, politics, etc.)
+        # Search entire page, not just profile_element
+        try:
+            badge_selectors = [
+                '.encounters-story-about__badge .pill__title',  # Badge titles
+                '.encounters-story-about__badge',
+                '.pill[data-qa-role="pill"] .pill__title',
+                '.pill[data-qa-role="pill"]',
+                '[class*="badge"]',
+            ]
+            
+            all_badges = []
+            seen_badges = set()
+            for selector in badge_selectors:
+                try:
+                    badges = browser.find_elements(By.CSS_SELECTOR, selector)
+                    for badge in badges:
+                        try:
+                            # Don't require is_displayed() - elements might be in DOM but not visible
+                            badge_text = badge.text.strip()
+                            
+                            # Skip if it's an image URL or empty
+                            if not badge_text or badge_text.startswith('http') or len(badge_text) < 1:
+                                continue
+                            
+                            # Normalize and deduplicate
+                            badge_lower = badge_text.lower()
+                            if badge_lower not in seen_badges:
+                                seen_badges.add(badge_lower)
+                                all_badges.append(badge_text)
+                        except:
+                            continue
+                except:
+                    continue
+            
+            if all_badges:
+                profile_data["badges"] = all_badges
+                print(f"{CYAN} Extracted {len(all_badges)} badge(s): {', '.join(all_badges[:5])}{'...' if len(all_badges) > 5 else ''}")
+        except Exception as e:
+            print(f"{YELLOW} Error extracting badges: {e}")
+            profile_data["badges"] = []
+        
+        # Extract question answers (e.g., "I'm a real nerd about", "My ultimate green flag is")
+        # Search entire page, not just profile_element
+        try:
+            question_sections = browser.find_elements(By.CSS_SELECTOR, '.encounters-story-section--question')
+            questions_answers = {}
+            
+            for section in question_sections:
+                try:
+                    # Don't require is_displayed() - elements might be in DOM but not visible
+                    # Get question title
+                    question_title_elem = section.find_element(By.CSS_SELECTOR, '.encounters-story-section__heading-title h2')
+                    question_title = question_title_elem.text.strip() if question_title_elem else None
+                    
+                    # Get answer text
+                    answer_elem = section.find_element(By.CSS_SELECTOR, '.encounters-story-about__text')
+                    answer_text = answer_elem.text.strip() if answer_elem else None
+                    
+                    if question_title and answer_text:
+                        questions_answers[question_title] = answer_text
+                except:
+                    continue
+            
+            if questions_answers:
+                profile_data["question_answers"] = questions_answers
+                print(f"{CYAN} Extracted {len(questions_answers)} question answer(s)")
+        except Exception as e:
+            print(f"{YELLOW} Error extracting question answers: {e}")
+            profile_data["question_answers"] = {}
+        
+        # Extract Spotify artists - search entire page
+        try:
+            spotify_artists = []
+            spotify_widget = browser.find_elements(By.CSS_SELECTOR, '.spotify-widget__artist')
+            
+            for artist in spotify_widget:
+                try:
+                    # Don't require is_displayed() - elements might be in DOM but not visible
+                    artist_name_elem = artist.find_element(By.CSS_SELECTOR, '.spotify-widget__artist-name')
+                    artist_name = artist_name_elem.text.strip() if artist_name_elem else None
+                    if artist_name and artist_name not in spotify_artists:
+                        spotify_artists.append(artist_name)
+                except:
+                    continue
+            
+            if spotify_artists:
+                profile_data["spotify_artists"] = spotify_artists
+                print(f"{CYAN} Extracted {len(spotify_artists)} Spotify artist(s)")
+        except Exception as e:
+            print(f"{YELLOW} Error extracting Spotify artists: {e}")
+            profile_data["spotify_artists"] = []
+        
+        # Extract "From" location (e.g., "🇺🇸 From Laguna Hills, CA")
+        # Search entire page
+        try:
+            location_pills = browser.find_elements(By.CSS_SELECTOR, '.location-widget__pill .pill__title')
+            from_locations = []
+            
+            for pill in location_pills:
+                try:
+                    # Don't require is_displayed() - elements might be in DOM but not visible
+                    pill_text = pill.text.strip()
+                    if 'from' in pill_text.lower() or '🇺🇸' in pill_text or '🇬🇧' in pill_text or '🇨🇦' in pill_text:
+                        from_locations.append(pill_text)
+                except:
+                    continue
+            
+            if from_locations:
+                profile_data["from_location"] = from_locations[0]  # Usually just one
+                print(f"{CYAN} Extracted from location: {profile_data['from_location']}")
+        except Exception as e:
+            print(f"{YELLOW} Error extracting from location: {e}")
+            profile_data["from_location"] = None
+        
+        # Extract job from encounters-story-profile__occupation if not already found
+        if not profile_data.get("job"):
+            try:
+                occupation_elem = browser.find_element(By.CSS_SELECTOR, '.encounters-story-profile__occupation')
+                job_text = occupation_elem.text.strip() if occupation_elem else None
+                if job_text:
+                    profile_data["job"] = job_text
+                    print(f"{CYAN} Extracted job from occupation field: {profile_data['job']}")
+            except:
                 pass
         
         # Print extracted data summary
@@ -971,7 +1114,7 @@ def set_location(browser: webdriver.Chrome, location: str) -> bool:
 
 def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1.5,
                     output_format: str = 'json', output_file: str = None, headless: bool = True,
-                    location: str = None):
+                    location: str = None, no_swipe: bool = False):
     """
     Scrape Bumble profiles by extracting data before swiping right.
     
@@ -983,11 +1126,15 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
         output_file: Output file path (optional, auto-generated if not provided)
         headless: Run browser in headless mode (default: True - recommended for automation)
         location: Location to set (e.g., "Seattle" or "Seattle, WA") - optional
+        no_swipe: If True, extract data without swiping (default: False - will swipe after extraction)
     """
     browser = None
     try:
         print(f"{CYAN} Initializing Bumble scraper...")
-        print(f"{CYAN} Mode: Extract profile data BEFORE swiping right")
+        if no_swipe:
+            print(f"{CYAN} Mode: Extract profile data ONLY (no swiping)")
+        else:
+            print(f"{CYAN} Mode: Extract profile data BEFORE swiping right")
         print(f"{CYAN} Headless: {headless}")
         
         def create_chrome_options():
@@ -1233,26 +1380,32 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
                 all_profiles.append(profile_data)
                 profile_count += 1
             
-            # NOW swipe right after extraction
-            print(f"{CYAN} Swiping right on profile {profile_count}...")
-            swipe_success = swipe_right(browser)
-            
-            if not swipe_success:
-                print(f"{YELLOW} Warning: Swipe failed - profile may have already been swiped")
-            
-            # Wait for next profile to load
-            time.sleep(delay)
-            
-            # Add random delay variation (0-1 second) to appear more human-like
-            if delay > 0:
-                random_delay = random.uniform(0, min(1.0, delay * 0.5))
-                time.sleep(random_delay)
-            
-            # Handle match popup if it appears
-            handle_match_popup(browser)
-            
-            # Wait a bit more for new profile to load
-            time.sleep(1)
+            # Swipe right after extraction (unless --no-swipe is set)
+            if not no_swipe:
+                print(f"{CYAN} Swiping right on profile {profile_count}...")
+                swipe_success = swipe_right(browser)
+                
+                if not swipe_success:
+                    print(f"{YELLOW} Warning: Swipe failed - profile may have already been swiped")
+                
+                # Wait for next profile to load
+                time.sleep(delay)
+                
+                # Add random delay variation (0-1 second) to appear more human-like
+                if delay > 0:
+                    random_delay = random.uniform(0, min(1.0, delay * 0.5))
+                    time.sleep(random_delay)
+                
+                # Handle match popup if it appears
+                handle_match_popup(browser)
+                
+                # Wait a bit more for new profile to load
+                time.sleep(1)
+            else:
+                # In no-swipe mode, we can't see the next profile without swiping
+                # So we break after extracting the current profile
+                print(f"{CYAN} No-swipe mode: Extracted profile {profile_count}, stopping (cannot see next profile without swiping)")
+                break
         
         # Save all profiles
         if not all_profiles:
@@ -1273,18 +1426,33 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
         else:  # CSV
             with open(output_file, 'w', newline='', encoding='utf-8') as f:
                 if all_profiles:
-                    fieldnames = ['extracted_at', 'name', 'age', 'bio', 'job', 'education', 'location', 'preferences', 'image_urls']
+                    fieldnames = [
+                        'extracted_at', 'name', 'age', 'bio', 'job', 'education', 
+                        'location', 'from_location', 'preferences', 'badges', 
+                        'question_answers', 'spotify_artists', 'image_urls'
+                    ]
                     writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
                     writer.writeheader()
                     for profile in all_profiles:
-                        # Convert image_urls list to semicolon-separated string for CSV
+                        # Convert lists/dicts to strings for CSV
                         row = profile.copy()
                         if 'image_urls' in row and isinstance(row['image_urls'], list):
                             row['image_urls'] = '; '.join(row['image_urls'])
+                        if 'badges' in row and isinstance(row['badges'], list):
+                            row['badges'] = '; '.join(row['badges'])
+                        if 'spotify_artists' in row and isinstance(row['spotify_artists'], list):
+                            row['spotify_artists'] = '; '.join(row['spotify_artists'])
+                        if 'question_answers' in row and isinstance(row['question_answers'], dict):
+                            # Convert dict to string format: "Q1: A1 | Q2: A2"
+                            qa_pairs = [f"{q}: {a}" for q, a in row['question_answers'].items()]
+                            row['question_answers'] = ' | '.join(qa_pairs)
                         writer.writerow(row)
         
         print(f"{GREEN} Data saved to: {output_file}")
-        print(f"{CYAN} Summary: {len(all_profiles)} profile(s) extracted and swiped right")
+        if no_swipe:
+            print(f"{CYAN} Summary: {len(all_profiles)} profile(s) extracted (no swiping)")
+        else:
+            print(f"{CYAN} Summary: {len(all_profiles)} profile(s) extracted and swiped right")
         
     except KeyboardInterrupt:
         print(f"\n{YELLOW} Interrupted by user")
@@ -1337,6 +1505,8 @@ def main():
                         help='Disable headless mode (show browser window for debugging)')
     parser.add_argument('--location', type=str, default=None,
                         help='Set location filter (e.g., "Seattle" or "Seattle, WA")')
+    parser.add_argument('--no-swipe', dest='no_swipe', action='store_true', default=False,
+                        help='Extract profile data without swiping (useful for testing/inspection)')
     
     args = parser.parse_args()
     
@@ -1352,7 +1522,8 @@ def main():
         output_format=args.format,
         output_file=args.output,
         headless=args.headless,
-        location=args.location
+        location=args.location,
+        no_swipe=args.no_swipe
     )
 
 
