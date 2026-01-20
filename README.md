@@ -12,6 +12,67 @@ This script is designed to automate the process of swiping right on all potentia
 7. Go to console tab paste the contents of [bumbleAutoLiker.js](https://github.com/amitoj-singh/bumble-auto-liker/blob/main/bumbleAutoLiker.js) and hit enter.
 9. Reload your page to stop the script.
 
+## Location Settings & Travel Mode
+
+**⚠️ IMPORTANT:** Bumble uses **IP-based geolocation** to determine which profiles you see. This means your physical IP address location takes priority over browser geolocation settings.
+
+### The Problem
+- **"Lives in" location** in profile settings is just a profile field - it doesn't change which profiles you see
+- **Search/matching location** is determined by your IP address
+- Setting browser geolocation doesn't override IP-based detection
+
+### Quick Decision Guide
+
+```
+Do you need unlimited swipes?
+├─ YES → Get Bumble Premium ($30-50/month)
+│   ├─ Test Travel Mode first (free with Premium)
+│   │   ├─ Works? → Use Travel Mode ✅ ($30-50/month total)
+│   │   └─ Doesn't work? → Add VPN ($35-65/month total)
+│   └─ Travel Mode not available? → Use VPN ($35-65/month total)
+│
+└─ NO → Use VPN only ($5-15/month)
+    └─ Note: You'll have swipe limits without Premium
+```
+
+### Solutions
+
+#### 1. Bumble Premium Travel Mode ⚠️ (Mobile App Only)
+- **Travel Mode allows changing location to any city for 7 days**
+- **CRITICAL LIMITATION: Travel Mode is NOT available on Bumble Web** (desktop browser)
+- **Only available on Bumble mobile app** (iOS/Android)
+- **May not work with web scraper** (IP-based geolocation may override)
+- **Cost:** Included with Premium ($30-50/month)
+- **Best if:** You need Premium anyway, and Travel Mode works with web scraping
+
+#### 2. VPN (Recommended for Web Scraping)
+- Changes your actual IP address to the target location
+- Most reliable method for automated web scraping
+- **Cost:** $5-15/month + Premium ($30-50/month) = **$35-65/month total**
+- **Best if:** Travel Mode doesn't work or you don't need Premium
+- See [PROXY_VPN_GUIDE.md](./PROXY_VPN_GUIDE.md) for setup instructions
+
+#### 3. Proxy (For Advanced Users)
+- More control, can rotate IPs per request
+- **Cost:** $0.01-7/GB (highly variable, can be expensive)
+- **Best if:** You need IP rotation or have specific proxy requirements
+- See [PROXY_VPN_GUIDE.md](./PROXY_VPN_GUIDE.md) for setup instructions
+
+### Cost Comparison
+
+| Solution | Monthly Cost | Reliability | Setup |
+|----------|-------------|-------------|-------|
+| **Premium + Travel Mode** | $30-50 | ⚠️ Unknown | ✅ Easy |
+| **Premium + VPN** | $35-65 | ✅ High | ✅ Easy |
+| **Premium + Residential Proxy** | $55-1450+ | ✅✅ Highest | ⚠️ Medium |
+| **Premium + Datacenter Proxy** | $30-110 | ⚠️ Medium | ⚠️ Medium |
+
+**Recommendation:** Try Travel Mode first (free with Premium), then use VPN if it doesn't work.
+
+For detailed information, see:
+- [TRAVEL_MODE.md](./TRAVEL_MODE.md) - Complete Travel Mode analysis and testing
+- [PROXY_VPN_GUIDE.md](./PROXY_VPN_GUIDE.md) - VPN/Proxy setup instructions
+
 ## Important Note
 
 As the Bumble UI keeps changing from time to time, it is possible that this script may encounter issues or may not work as expected due to updates made by Tinder.

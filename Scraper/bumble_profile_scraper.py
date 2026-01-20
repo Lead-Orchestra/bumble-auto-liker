@@ -1201,11 +1201,50 @@ def set_location_geolocation(browser: webdriver.Chrome, location: str) -> bool:
         
         # Set geolocation using Chrome DevTools Protocol
         print(f"{CYAN} Setting geolocation to: {coords['latitude']}, {coords['longitude']}")
+        
+        # Grant geolocation permission first
+        try:
+            browser.execute_cdp_cmd('Browser.grantPermissions', {
+                'origin': 'https://bumble.com',
+                'permissions': ['geolocation']
+            })
+            browser.execute_cdp_cmd('Browser.grantPermissions', {
+                'origin': 'https://www.bumble.com',
+                'permissions': ['geolocation']
+            })
+        except:
+            pass  # Permissions may already be granted
+        
+        # Set geolocation override
         browser.execute_cdp_cmd('Emulation.setGeolocationOverride', {
             'latitude': coords['latitude'],
             'longitude': coords['longitude'],
             'accuracy': 100
         })
+        
+        # Also set timezone to match location (helps with location detection)
+        try:
+            # Get timezone for location
+            timezone_map = {
+                'seattle': 'America/Los_Angeles',
+                'denver': 'America/Denver',
+                'new york': 'America/New_York',
+                'los angeles': 'America/Los_Angeles',
+                'chicago': 'America/Chicago',
+                'san francisco': 'America/Los_Angeles',
+                'austin': 'America/Chicago',
+                'miami': 'America/New_York',
+            }
+            location_lower = location.lower().strip()
+            city_name = location_lower.split(',')[0].strip()
+            timezone = timezone_map.get(city_name, 'America/Los_Angeles')
+            
+            browser.execute_cdp_cmd('Emulation.setTimezoneOverride', {
+                'timezoneId': timezone
+            })
+            print(f"{CYAN} Also set timezone to: {timezone}")
+        except Exception as e:
+            print(f"{YELLOW} Could not set timezone: {e}")
         
         print(f"{GREEN} Geolocation set successfully")
         return True
@@ -1239,7 +1278,11 @@ def set_location(browser: webdriver.Chrome, location: str) -> bool:
         
         # Navigate to settings page
         # Bumble settings are typically at /app/settings or accessible via a settings button
+        # IMPORTANT: "Lives in" location is different from search/matching location
+        # We need to find the "Discovery location" or "Search location" setting, not just "Lives in"
         print(f"{CYAN} Navigating to Bumble settings...")
+        print(f"{YELLOW} Note: 'Lives in' location is different from search/matching location.")
+        print(f"{YELLOW} We need to find 'Discovery location' or 'Search location' setting.")
         
         # Try multiple ways to access settings:
         # 1. Direct URL
@@ -1247,6 +1290,8 @@ def set_location(browser: webdriver.Chrome, location: str) -> bool:
             "https://www.bumble.com/app/settings",
             "https://app.bumble.com/settings",
             "https://www.bumble.com/app/preferences",
+            "https://www.bumble.com/app/settings/location",  # Direct location settings
+            "https://app.bumble.com/settings/location",
         ]
         
         settings_accessed = False
@@ -1292,14 +1337,22 @@ def set_location(browser: webdriver.Chrome, location: str) -> bool:
         
         if not settings_accessed:
             print(f"{YELLOW} Could not access settings page, trying to set location via filters...")
-            # Try to access filters directly
+            # Try to access filters directly from the app page
             try:
-                # Look for filter button
+                # First, make sure we're on the app page
+                if 'app' not in browser.current_url:
+                    browser.get("https://www.bumble.com/app")
+                    time.sleep(3)
+                
+                # Look for filter button - Bumble has a filters button on the main app page
                 filter_selectors = [
                     'button[aria-label*="Filter"]',
                     'button[aria-label*="filter"]',
                     'button[class*="filter"]',
                     '[data-testid*="filter"]',
+                    'button[class*="encounters-controls"]',  # Filter might be in controls
+                    'a[href*="filter"]',
+                    'a[href*="settings"]',
                 ]
                 
                 for selector in filter_selectors:
@@ -1308,23 +1361,37 @@ def set_location(browser: webdriver.Chrome, location: str) -> bool:
                         if filter_btn.is_displayed():
                             filter_btn.click()
                             time.sleep(2)
-                            print(f"{GREEN} Opened filters")
+                            print(f"{GREEN} Opened filters/settings")
+                            settings_accessed = True
                             break
                     except:
                         continue
-            except:
-                pass
+            except Exception as e:
+                print(f"{YELLOW} Error accessing filters: {e}")
         
         # Try to find location input/selector
-        print(f"{CYAN} Looking for location input field...")
+        # Look for "Discovery location", "Search location", or "Location" settings
+        # NOT "Lives in" - that's just a profile field
+        print(f"{CYAN} Looking for location input field (Discovery/Search location, not 'Lives in')...")
         location_selectors = [
+            'input[placeholder*="discovery location" i]',
+            'input[placeholder*="search location" i]',
             'input[placeholder*="location" i]',
             'input[placeholder*="city" i]',
+            'input[name*="discovery" i]',
+            'input[name*="search" i]',
             'input[name*="location" i]',
+            'input[id*="discovery" i]',
+            'input[id*="search" i]',
             'input[id*="location" i]',
             'input[type="text"][class*="location"]',
             'select[name*="location" i]',
             'select[id*="location" i]',
+            # Also look for buttons/links that might open location picker
+            'button[aria-label*="change location" i]',
+            'button[aria-label*="update location" i]',
+            'button[aria-label*="location" i]',
+            'a[href*="location"]',
         ]
         
         location_set = False
@@ -1374,8 +1441,14 @@ def set_location(browser: webdriver.Chrome, location: str) -> bool:
             time.sleep(3)
             return True
         else:
-            print(f"{YELLOW} Could not find location input field. Location may need to be set manually in Bumble settings.")
-            print(f"{YELLOW} Note: Bumble may use browser geolocation or require manual location setting.")
+            print(f"{YELLOW} Could not find location input field.")
+            print(f"{YELLOW} IMPORTANT: 'Lives in' location in profile settings does NOT change which profiles you see.")
+            print(f"{YELLOW} Bumble uses IP-based geolocation for matching, which overrides browser geolocation.")
+            print(f"{YELLOW} To get Seattle profiles with web scraper, you need:")
+            print(f"{YELLOW}   1. A VPN/proxy with a Seattle IP address (most reliable for web scraping)")
+            print(f"{YELLOW}   2. Bumble Premium Travel Mode (mobile app only - NOT available on web)")
+            print(f"{YELLOW}   3. Or manually change 'Discovery location' in Bumble settings (if available)")
+            print(f"{YELLOW} See TRAVEL_MODE.md for detailed information about location options.")
             # Navigate back to app page
             browser.get("https://www.bumble.com/app")
             time.sleep(3)
@@ -1560,13 +1633,46 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
             except Exception as e:
                 print(f"{YELLOW} Error navigating: {e}")
         
-        # NOTE: We don't set location via geolocation anymore
-        # Location is extracted from the actual HTML shown in the profile
-        # Setting geolocation doesn't reliably change what profiles Bumble shows
-        # The location in the profile HTML is what we extract and use
+        # Set location if provided
+        # IMPORTANT: Bumble uses IP-based geolocation primarily, so browser geolocation may not fully override it
+        # However, we'll try multiple methods to set location:
+        # 1. Browser geolocation API (Chrome DevTools Protocol)
+        # 2. Bumble settings/filters UI
+        # 3. Note: If your IP address is in Denver, Bumble will likely show Denver profiles regardless
+        # NOTE: "Lives in" location in profile settings is different from search/matching location
+        # Bumble may still use IP-based geolocation for matching even if "Lives in" is set to Seattle
+        # 
+        # TRAVEL MODE NOTE:
+        # - Bumble Premium Travel Mode allows changing location to any city (7 days)
+        # - However, Travel Mode is NOT available on Bumble Web (only mobile app)
+        # - For web scraping, you need a VPN/proxy with target city IP address
+        # - See TRAVEL_MODE.md for more details
         if location:
-            print(f"{CYAN} Note: Location parameter '{location}' provided, but we extract actual location from profile HTML")
-            print(f"{CYAN} The location shown in profiles may differ from the parameter (this is expected)")
+            print(f"{CYAN} Attempting to set location to: {location}")
+            print(f"{YELLOW} Note: Bumble primarily uses IP-based geolocation for matching.")
+            print(f"{YELLOW} 'Lives in' location in profile settings is different from search/matching location.")
+            print(f"{YELLOW} If your IP is in Denver, you may still see Denver profiles even after setting location.")
+            print(f"{YELLOW} Travel Mode (Bumble Premium) is NOT available on Bumble Web (mobile app only).")
+            print(f"{YELLOW} To get Seattle profiles with web scraper, you need a VPN/proxy with a Seattle IP address.")
+            print(f"{YELLOW} See TRAVEL_MODE.md for more information about location options.")
+            
+            location_set = set_location(browser, location)
+            if location_set:
+                print(f"{GREEN} Location setting attempted.")
+                print(f"{CYAN} Refreshing app page to apply location change...")
+                # Navigate away and back to force refresh
+                browser.get("https://www.bumble.com")
+                time.sleep(2)
+                browser.get("https://www.bumble.com/app")
+                time.sleep(5)  # Wait longer for location to take effect
+                print(f"{CYAN} App page refreshed. Profiles shown may still be based on IP address.")
+            else:
+                print(f"{YELLOW} Location setting failed. Bumble may require manual location change in settings.")
+                print(f"{YELLOW} If you manually set 'Lives in' to Seattle, note that this may not change matching location.")
+                print(f"{YELLOW} Bumble may have a separate 'Discovery location' or 'Search location' setting.")
+            
+            # Wait a bit after setting location
+            time.sleep(3)
         
         # Save HTML for debugging (first time)
         try:
