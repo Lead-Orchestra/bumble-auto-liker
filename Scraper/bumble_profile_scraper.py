@@ -37,6 +37,24 @@ RED = "[X]"
 YELLOW = "[!]"
 CYAN = "[*]"
 
+# Safe print function that handles Unicode encoding errors
+def safe_print(*args, **kwargs):
+    """Print function that safely handles Unicode characters on Windows"""
+    try:
+        print(*args, **kwargs)
+    except UnicodeEncodeError:
+        # Fallback: encode to ASCII with error handling
+        encoded_args = []
+        for arg in args:
+            if isinstance(arg, str):
+                try:
+                    encoded_args.append(arg.encode('ascii', 'replace').decode('ascii'))
+                except:
+                    encoded_args.append(repr(arg))
+            else:
+                encoded_args.append(str(arg))
+        print(*encoded_args, **kwargs)
+
 
 def load_cookies_from_file(cookie_file: str) -> Optional[List[Dict]]:
     """Load cookies from JSON file extracted by extract_bumble_cookies.py"""
@@ -776,9 +794,9 @@ def extract_profile_data(browser: webdriver.Chrome) -> Optional[Dict]:
                             if badge_lower not in seen_badges:
                                 seen_badges.add(badge_lower)
                                 all_badges.append(badge_text)
-                                print(f"{CYAN}   Added badge: {badge_text}")
-                        except Exception as e:
-                            print(f"{YELLOW}   Error processing badge: {e}")
+                                safe_print(f"{CYAN}   Added badge: {badge_text}")
+                            except Exception as e:
+                            safe_print(f"{YELLOW}   Error processing badge: {e}")
                             continue
                 except Exception as e:
                     print(f"{YELLOW} Error with selector {selector}: {e}")
@@ -940,9 +958,9 @@ def extract_profile_data(browser: webdriver.Chrome) -> Optional[Dict]:
                             # Check for location indicators (flags, "Lives in", "From")
                             if pill_text and any(indicator in pill_text.lower() for indicator in ['lives in', 'from', '🇺🇸', '🇬🇧', '🇨🇦', '🇲🇽', '🇦🇺']):
                                 from_locations.append(pill_text)
-                                print(f"{CYAN} Found from location: {pill_text}")
+                                safe_print(f"{CYAN} Found from location: {pill_text}")
                         except Exception as e:
-                            print(f"{YELLOW} Error processing pill: {e}")
+                            safe_print(f"{YELLOW} Error processing pill: {e}")
                             continue
                     if from_locations:
                         break
@@ -959,7 +977,7 @@ def extract_profile_data(browser: webdriver.Chrome) -> Optional[Dict]:
                     # Look for "from" location (not "lives in")
                     if 'from' in badge_lower and 'lives in' not in badge_lower:
                         from_locations.append(badge)
-                        print(f"{CYAN} Found from location in badges: {badge}")
+                        safe_print(f"{CYAN} Found from location in badges: {badge}")
                         break  # Take first "From" location found
             
             if from_locations:
@@ -972,7 +990,7 @@ def extract_profile_data(browser: webdriver.Chrome) -> Optional[Dict]:
                 if not from_location:
                     from_location = from_locations[0]
                 profile_data["from_location"] = from_location
-                print(f"{CYAN} Extracted from location: {profile_data['from_location']}")
+                safe_print(f"{CYAN} Extracted from location: {profile_data['from_location']}")
             else:
                 profile_data["from_location"] = None
                 print(f"{CYAN} No from location found")
@@ -1726,6 +1744,8 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
         # Scrape profiles
         all_profiles = []
         profile_count = 0
+        consecutive_failures = 0
+        max_consecutive_failures = 3  # Stop after 3 consecutive failures
         
         while True:
             # Check limit
@@ -1739,22 +1759,73 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
             profile_data = extract_profile_data(browser)
             
             if not profile_data:
-                print(f"{YELLOW} Warning: Could not extract profile data - no profile visible")
+                consecutive_failures += 1
+                print(f"{YELLOW} Warning: Could not extract profile data - no profile visible (failure {consecutive_failures}/{max_consecutive_failures})")
+                
+                # Check if we hit the daily swipe limit (vote quota)
+                try:
+                    blocker_elem = browser.find_element(By.CSS_SELECTOR, '.encounters-user__blocker, [data-qa-role="encounters-blocker-vote-quota"]')
+                    if blocker_elem and blocker_elem.is_displayed():
+                        # Check for the specific limit message
+                        try:
+                            title_elem = blocker_elem.find_element(By.CSS_SELECTOR, '[data-qa-role="cta-box-title"], .cta-box__title')
+                            title_text = title_elem.text.lower() if title_elem else ""
+                            if 'end of the line' in title_text or 'hit the end' in title_text:
+                                print(f"{CYAN} Daily swipe limit reached: 'You've hit the end of the line — for today!'")
+                                print(f"{CYAN} Successfully extracted {profile_count} profile(s) before hitting limit")
+                                break
+                        except:
+                            # If we found the blocker element, it's likely the limit
+                            print(f"{CYAN} Daily swipe limit detected (encounters-blocker-vote-quota)")
+                            print(f"{CYAN} Successfully extracted {profile_count} profile(s) before hitting limit")
+                            break
+                except NoSuchElementException:
+                    pass  # Blocker not found, continue with other checks
+                except Exception as e:
+                    print(f"{YELLOW} Error checking for swipe limit: {e}")
                 
                 # Check if we hit the end (no more profiles)
                 page_source = browser.page_source.lower()
-                if 'no more profiles' in page_source or 'out of people' in page_source or 'no one new' in page_source:
-                    print(f"{CYAN} No more profiles available")
+                end_indicators = [
+                    'no more profiles', 'out of people', 'no one new', 
+                    'no one around', 'all caught up', 'see you tomorrow',
+                    'come back tomorrow', 'no matches', 'empty state',
+                    'end of the line', 'hit the end', 'vote quota',
+                    'upgrade to bumble boost', 'wait until tomorrow'
+                ]
+                if any(indicator in page_source for indicator in end_indicators):
+                    print(f"{CYAN} No more profiles available (detected end state)")
+                    if profile_count > 0:
+                        print(f"{CYAN} Successfully extracted {profile_count} profile(s) before stopping")
+                    break
+                
+                # Check URL for empty state indicators
+                current_url = browser.current_url.lower()
+                if 'empty' in current_url or 'out-of-people' in current_url:
+                    print(f"{CYAN} No more profiles available (detected in URL)")
+                    if profile_count > 0:
+                        print(f"{CYAN} Successfully extracted {profile_count} profile(s) before stopping")
+                    break
+                
+                # Stop after max consecutive failures
+                if consecutive_failures >= max_consecutive_failures:
+                    print(f"{YELLOW} Stopping after {max_consecutive_failures} consecutive failures to extract profile")
+                    if profile_count > 0:
+                        print(f"{CYAN} Successfully extracted {profile_count} profile(s) before stopping")
                     break
                 
                 # Try handling match popup or continue button
                 if handle_match_popup(browser):
                     time.sleep(2)
+                    consecutive_failures = 0  # Reset counter if popup was handled
                     continue
                 
                 # Wait a bit and try again
                 time.sleep(2)
                 continue
+            
+            # Reset failure counter on successful extraction
+            consecutive_failures = 0
             
             # Add profile data
             if profile_data.get("name"):
