@@ -14,6 +14,7 @@ import os
 import time
 import random
 import re
+import subprocess
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Optional
@@ -1484,9 +1485,131 @@ def set_location(browser: webdriver.Chrome, location: str) -> bool:
         return False
 
 
+def save_profile_to_notion(profile_data: Dict, backend_root: str = None) -> bool:
+    """
+    Save a profile to Notion using the Node.js script with retry logic.
+    Returns True if successful, False otherwise.
+    """
+    try:
+        # Find backend root (parent of submodules)
+        if not backend_root:
+            current_dir = Path(__file__).resolve()
+            # Go up: Scraper -> bumble-auto-liker -> submodules -> backend
+            backend_root = current_dir.parent.parent.parent
+        
+        script_path = Path(backend_root) / 'scripts' / 'save-bumble-profile-to-notion.ts'
+        
+        if not script_path.exists():
+            print(f"{YELLOW} Notion save script not found at {script_path}, skipping Notion save")
+            return False
+        
+        # Convert profile data to JSON
+        profile_json = json.dumps(profile_data, ensure_ascii=False)
+        
+        # Call Node.js script via subprocess
+        # Use pnpm or node directly
+        result = None
+        try:
+            # Try pnpm first (if available)
+            result = subprocess.run(
+                ['pnpm', 'tsx', str(script_path)],
+                input=profile_json,
+                text=True,
+                capture_output=True,
+                timeout=60,  # Increased timeout for retry logic
+                cwd=str(backend_root),
+                env=os.environ.copy()  # Pass environment variables (including NOTION_TOKEN)
+            )
+        except FileNotFoundError:
+            # Fallback to npx with tsx
+            try:
+                result = subprocess.run(
+                    ['npx', 'tsx', str(script_path)],
+                    input=profile_json,
+                    text=True,
+                    capture_output=True,
+                    timeout=60,
+                    cwd=str(backend_root),
+                    env=os.environ.copy()
+                )
+            except FileNotFoundError:
+                print(f"{YELLOW} Could not execute Notion save script (pnpm/npx not found), skipping Notion save")
+                return False
+        except subprocess.TimeoutExpired:
+            print(f"{YELLOW} Notion save script timed out (may be retrying), skipping Notion save")
+            return False
+        
+        if result and result.returncode == 0:
+            # Check output for success/duplicate messages
+            output = result.stdout.strip()
+            if '✅ Saved:' in output or '⏭️  Duplicate:' in output:
+                # Print without the script's own log prefix to avoid duplication
+                lines = [line for line in output.split('\n') if line.strip() and not line.startswith('✅ Loaded')]
+                if lines:
+                    print(f"{CYAN} {lines[-1]}")  # Print last line (the result)
+                return True
+            else:
+                # Unexpected success output
+                if output:
+                    print(f"{CYAN} {output}")
+                return True
+        elif result:
+            error_output = result.stderr.strip() or result.stdout.strip()
+            # Don't print error if it's just a duplicate or validation error (these are expected)
+            if 'duplicate' in error_output.lower() or 'validation' in error_output.lower() or 'Skipping profile' in error_output:
+                lines = [line for line in error_output.split('\n') if line.strip() and not line.startswith('✅ Loaded')]
+                if lines:
+                    print(f"{CYAN} {lines[-1]}")
+                return True
+            else:
+                # Real error - but don't spam, just log briefly
+                error_lines = [line for line in error_output.split('\n') if '❌' in line or 'Error' in line]
+                if error_lines:
+                    print(f"{YELLOW} Notion save failed: {error_lines[0]}")
+                return False
+        else:
+            return False
+                
+    except Exception as e:
+        print(f"{YELLOW} Error saving to Notion: {e}")
+        return False
+
+
+def save_profile_to_json(profile_data: Dict, json_file: str) -> bool:
+    """
+    Save a single profile to JSON file incrementally (append mode).
+    Creates file if it doesn't exist, appends if it does.
+    Returns True if successful, False otherwise.
+    """
+    try:
+        # Read existing profiles if file exists
+        existing_profiles = []
+        if Path(json_file).exists():
+            try:
+                with open(json_file, 'r', encoding='utf-8') as f:
+                    existing_profiles = json.load(f)
+                    if not isinstance(existing_profiles, list):
+                        existing_profiles = []
+            except (json.JSONDecodeError, IOError):
+                existing_profiles = []
+        
+        # Add new profile
+        existing_profiles.append(profile_data)
+        
+        # Write back to file
+        with open(json_file, 'w', encoding='utf-8') as f:
+            json.dump(existing_profiles, f, indent=2, ensure_ascii=False)
+        
+        return True
+    except Exception as e:
+        print(f"{YELLOW} Error saving profile to JSON: {e}")
+        return False
+
+
 def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1.5,
                     output_format: str = 'json', output_file: str = None, headless: bool = True,
-                    location: str = None, no_swipe: bool = False, keep_browser_open: bool = False):
+                    location: str = None, no_swipe: bool = False, keep_browser_open: bool = False,
+                    save_to_notion: bool = False):
     """
     Scrape Bumble profiles by extracting data before swiping right.
     
@@ -1508,6 +1631,10 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
         else:
             print(f"{CYAN} Mode: Extract profile data BEFORE swiping right")
         print(f"{CYAN} Headless: {headless}")
+        if save_to_notion:
+            print(f"{CYAN} Notion saving: ENABLED (each profile saved to JSON backup first, then to Notion with retry logic)")
+        else:
+            print(f"{CYAN} Notion saving: DISABLED (profiles will be saved to JSON file only)")
         
         def create_chrome_options():
             """Create a new ChromeOptions object (cannot be reused)"""
@@ -1748,6 +1875,24 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
         consecutive_failures = 0
         max_consecutive_failures = 3  # Stop after 3 consecutive failures
         
+        # Initialize JSON file path for incremental saving (backup)
+        json_backup_file = None
+        if output_format == 'json':
+            if not output_file:
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                suffix = '_backup' if save_to_notion else ''
+                json_backup_file = f"bumble_profiles_{timestamp}{suffix}.json"
+            else:
+                json_backup_file = output_file
+            # Initialize empty JSON file
+            try:
+                with open(json_backup_file, 'w', encoding='utf-8') as f:
+                    json.dump([], f, indent=2, ensure_ascii=False)
+                print(f"{CYAN} Initialized JSON backup file: {json_backup_file}")
+            except Exception as e:
+                print(f"{YELLOW} Warning: Could not initialize JSON backup file: {e}")
+                json_backup_file = None
+        
         while True:
             # Check limit
             if limit and profile_count >= limit:
@@ -1845,9 +1990,28 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
             # Only add profile data if it has a valid name
             profile_name = profile_data.get("name")
             if profile_name and profile_name.strip() and profile_name.lower() not in ['none', 'null', 'undefined']:
+                # STEP 1: Save to JSON immediately (backup) - ALWAYS do this first
+                json_saved = False
+                if json_backup_file:
+                    json_saved = save_profile_to_json(profile_data, json_backup_file)
+                    if json_saved:
+                        print(f"{CYAN} Saved to JSON backup: {profile_data.get('name', 'Unknown')} ({profile_data.get('age', '?')})")
+                    else:
+                        print(f"{YELLOW} Warning: Failed to save {profile_data.get('name', 'Unknown')} to JSON backup")
+                
+                # STEP 2: Save to Notion if enabled (after JSON backup)
+                notion_saved = False
+                if save_to_notion:
+                    notion_saved = save_profile_to_notion(profile_data)
+                    # Note: save_profile_to_notion already prints status messages
+                
+                # Always add to list for final JSON save (redundancy)
                 all_profiles.append(profile_data)
                 profile_count += 1
-                print(f"{GREEN} Extracted: {profile_data.get('name', 'Unknown')} ({profile_data.get('age', '?')})")
+                
+                if not save_to_notion and not json_backup_file:
+                    # Only print extraction message if neither Notion nor JSON backup is enabled
+                    print(f"{GREEN} Extracted: {profile_data.get('name', 'Unknown')} ({profile_data.get('age', '?')})")
             else:
                 print(f"{YELLOW} Warning: Profile data incomplete (missing or invalid name) - skipping and moving to next profile")
                 consecutive_failures += 1
@@ -1909,15 +2073,25 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
         
         print(f"{GREEN} Successfully extracted {len(all_profiles)} profile(s)")
         
-        # Generate output filename if not provided
-        if not output_file:
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            output_file = f"bumble_profiles_{timestamp}.{output_format}"
-        
-        # Save to file
+        # Final JSON save (redundancy check - profiles should already be saved incrementally)
+        # This ensures we have a complete file even if incremental saves failed
         if output_format == 'json':
-            with open(output_file, 'w', encoding='utf-8') as f:
-                json.dump(all_profiles, f, indent=2, ensure_ascii=False)
+            # Use the backup file if it exists, otherwise generate a new one
+            final_json_file = json_backup_file if json_backup_file else output_file
+            if not final_json_file:
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                suffix = '_backup' if save_to_notion else ''
+                final_json_file = f"bumble_profiles_{timestamp}{suffix}.json"
+            
+            # Final save to ensure completeness
+            try:
+                with open(final_json_file, 'w', encoding='utf-8') as f:
+                    json.dump(all_profiles, f, indent=2, ensure_ascii=False)
+                print(f"{GREEN} Final JSON backup saved: {final_json_file} ({len(all_profiles)} profiles)")
+            except Exception as e:
+                print(f"{YELLOW} Warning: Could not save final JSON backup: {e}")
+            
+            output_file = final_json_file
         else:  # CSV
             with open(output_file, 'w', newline='', encoding='utf-8') as f:
                 if all_profiles:
@@ -1943,22 +2117,38 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
                             row['question_answers'] = ' | '.join(qa_pairs)
                         writer.writerow(row)
         
-        print(f"{GREEN} Data saved to: {output_file}")
-        if no_swipe:
-            print(f"{CYAN} Summary: {len(all_profiles)} profile(s) extracted (no swiping)")
+        if output_format == 'json':
+            print(f"{GREEN} JSON backup file: {output_file}")
         else:
-            print(f"{CYAN} Summary: {len(all_profiles)} profile(s) extracted and swiped right")
+            print(f"{GREEN} Data saved to: {output_file}")
+        
+        if save_to_notion:
+            print(f"{CYAN} Summary: {len(all_profiles)} profile(s) extracted, saved to JSON backup, and synced to Notion")
+        else:
+            print(f"{CYAN} Summary: {len(all_profiles)} profile(s) extracted and saved to JSON")
+        
+        if no_swipe:
+            print(f"{CYAN} Mode: Extract only (no swiping)")
+        else:
+            print(f"{CYAN} Mode: Extract and swipe right")
         
     except KeyboardInterrupt:
         print(f"\n{YELLOW} Interrupted by user")
         if all_profiles:
             print(f"{CYAN} Saving {len(all_profiles)} profile(s) extracted so far...")
-            if not output_file:
-                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                output_file = f"bumble_profiles_{timestamp}_partial.{output_format}"
+            # Use existing JSON backup file if available, otherwise create partial file
             if output_format == 'json':
-                with open(output_file, 'w', encoding='utf-8') as f:
-                    json.dump(all_profiles, f, indent=2, ensure_ascii=False)
+                partial_file = json_backup_file if json_backup_file else None
+                if not partial_file:
+                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    partial_file = f"bumble_profiles_{timestamp}_partial.json"
+                # Final save of all profiles to ensure completeness
+                try:
+                    with open(partial_file, 'w', encoding='utf-8') as f:
+                        json.dump(all_profiles, f, indent=2, ensure_ascii=False)
+                    print(f"{GREEN} Partial JSON backup saved: {partial_file} ({len(all_profiles)} profiles)")
+                except Exception as e:
+                    print(f"{YELLOW} Warning: Could not save partial JSON backup: {e}")
             else:
                 with open(output_file, 'w', newline='', encoding='utf-8') as f:
                     if all_profiles:
@@ -2015,6 +2205,8 @@ def main():
                         help='Extract profile data without swiping (useful for testing/inspection)')
     parser.add_argument('--keep-browser-open', dest='keep_browser_open', action='store_true', default=False,
                         help='Keep browser open after scraping completes (useful for debugging)')
+    parser.add_argument('--save-to-notion', dest='save_to_notion', action='store_true', default=False,
+                        help='Save each profile directly to Notion with retry logic (fallback to JSON if fails)')
     
     args = parser.parse_args()
     
@@ -2032,7 +2224,8 @@ def main():
         headless=args.headless,
         location=args.location,
         no_swipe=args.no_swipe,
-        keep_browser_open=args.keep_browser_open
+        keep_browser_open=args.keep_browser_open,
+        save_to_notion=args.save_to_notion
     )
 
 
