@@ -793,7 +793,7 @@ def extract_profile_data(browser: webdriver.Chrome) -> Optional[Dict]:
                                 seen_badges.add(badge_lower)
                                 all_badges.append(badge_text)
                                 safe_print(f"{CYAN}   Added badge: {badge_text}")
-                            except Exception as e:
+                        except Exception as e:
                             safe_print(f"{YELLOW}   Error processing badge: {e}")
                             continue
                 except Exception as e:
