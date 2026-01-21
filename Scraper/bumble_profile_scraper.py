@@ -1821,7 +1821,21 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
                     consecutive_failures = 0  # Reset counter if popup was handled
                     continue
                 
-                # Wait a bit and try again
+                # If extraction failed, try to swipe/click to move to next profile
+                # This prevents getting stuck on the same profile
+                if not no_swipe:
+                    print(f"{CYAN} Extraction failed - attempting to swipe/click to move to next profile...")
+                    swipe_success = swipe_right(browser)
+                    if not swipe_success:
+                        # Try clicking continue button as fallback
+                        handle_match_popup(browser)
+                    time.sleep(delay)
+                else:
+                    # In no-swipe mode, we can't move forward, so break
+                    print(f"{CYAN} No-swipe mode: Cannot move to next profile without swiping")
+                    break
+                
+                # Wait a bit before trying next profile
                 time.sleep(2)
                 continue
             
@@ -1835,11 +1849,29 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
                 profile_count += 1
                 print(f"{GREEN} Extracted: {profile_data.get('name', 'Unknown')} ({profile_data.get('age', '?')})")
             else:
-                print(f"{YELLOW} Warning: Profile data incomplete (missing or invalid name) - skipping")
+                print(f"{YELLOW} Warning: Profile data incomplete (missing or invalid name) - skipping and moving to next profile")
                 consecutive_failures += 1
                 # Don't add incomplete profiles to the list
-                # Wait a bit and try again
-                time.sleep(2)
+                # Swipe/click to move to next profile instead of retrying the same one
+                if not no_swipe:
+                    print(f"{CYAN} Attempting to swipe/click to move to next profile...")
+                    swipe_success = swipe_right(browser)
+                    if not swipe_success:
+                        # Try clicking continue button as fallback
+                        handle_match_popup(browser)
+                    time.sleep(delay)
+                else:
+                    # In no-swipe mode, we can't move forward, so break
+                    print(f"{CYAN} No-swipe mode: Cannot move to next profile without swiping")
+                    break
+                
+                # Stop if we've hit max consecutive failures
+                if consecutive_failures >= max_consecutive_failures:
+                    print(f"{YELLOW} Stopping after {max_consecutive_failures} consecutive failures to extract profile")
+                    if profile_count > 0:
+                        print(f"{CYAN} Successfully extracted {profile_count} profile(s) before stopping")
+                    break
+                
                 continue
             
             # Swipe right after extraction (unless --no-swipe is set)
