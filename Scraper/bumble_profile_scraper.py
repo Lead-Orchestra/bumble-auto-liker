@@ -169,10 +169,14 @@ def inject_cookies_to_browser(browser: webdriver.Chrome, cookies: List[Dict]) ->
         return False
 
 
-def extract_profile_data(browser: webdriver.Chrome) -> Optional[Dict]:
+def extract_profile_data(browser: webdriver.Chrome, gender: str = None) -> Optional[Dict]:
     """
     Extract profile data from the current visible profile card.
     Returns None if no profile is visible.
+    
+    Args:
+        browser: Selenium WebDriver instance
+        gender: Optional gender to set for the profile (e.g., "female", "male", "non-binary")
     """
     try:
         # Wait for profile card to be visible
@@ -281,6 +285,10 @@ def extract_profile_data(browser: webdriver.Chrome) -> Optional[Dict]:
         profile_data = {
             "extracted_at": datetime.now().isoformat(),
         }
+        
+        # Set gender if provided via command line argument
+        if gender:
+            profile_data["gender"] = gender
         
         # Extract name and age from specific selectors (more reliable than regex)
         # HTML structure: .encounters-story-profile__name and .encounters-story-profile__age
@@ -1584,7 +1592,7 @@ def save_profile_to_notion(profile_data: Dict, backend_root: str = None) -> bool
         script_path = Path(backend_root) / 'scripts' / 'save-bumble-profile-to-notion.ts'
         
         if not script_path.exists():
-            print(f"{YELLOW} Notion save script not found at {script_path}, skipping Notion save")
+            print(f"{YELLOW} ⚠️  Notion save script not found at {script_path}, skipping Notion save")
             return False
         
         # Convert profile data to JSON
@@ -1599,6 +1607,8 @@ def save_profile_to_notion(profile_data: Dict, backend_root: str = None) -> bool
                 ['pnpm', 'tsx', str(script_path)],
                 input=profile_json,
                 text=True,
+                encoding='utf-8',
+                errors='replace',  # Replace invalid characters instead of failing
                 capture_output=True,
                 timeout=60,  # Increased timeout for retry logic
                 cwd=str(backend_root),
@@ -1611,16 +1621,19 @@ def save_profile_to_notion(profile_data: Dict, backend_root: str = None) -> bool
                     ['npx', 'tsx', str(script_path)],
                     input=profile_json,
                     text=True,
+                    encoding='utf-8',
+                    errors='replace',  # Replace invalid characters instead of failing
                     capture_output=True,
                     timeout=60,
                     cwd=str(backend_root),
                     env=os.environ.copy()
                 )
             except FileNotFoundError:
-                print(f"{YELLOW} Could not execute Notion save script (pnpm/npx not found), skipping Notion save")
+                print(f"{YELLOW} ⚠️  Could not execute Notion save script (pnpm/npx not found), skipping Notion save")
                 return False
         except subprocess.TimeoutExpired:
-            print(f"{YELLOW} Notion save script timed out (may be retrying), skipping Notion save")
+            profile_name = profile_data.get('name', 'Unknown')
+            print(f"{YELLOW} ⏱️  Notion save script timed out for {profile_name} (may be retrying), skipping Notion save")
             return False
         
         if result and result.returncode == 0:
@@ -1630,12 +1643,16 @@ def save_profile_to_notion(profile_data: Dict, backend_root: str = None) -> bool
                 # Print without the script's own log prefix to avoid duplication
                 lines = [line for line in output.split('\n') if line.strip() and not line.startswith('✅ Loaded')]
                 if lines:
-                    print(f"{CYAN} {lines[-1]}")  # Print last line (the result)
+                    # Replace "✅ Saved:" with "✅ Saved to Notion:"
+                    last_line = lines[-1]
+                    if '✅ Saved:' in last_line:
+                        last_line = last_line.replace('✅ Saved:', '✅ Saved to Notion:')
+                    print(f"{CYAN} {last_line}")  # Print last line (the result)
                 return True
             else:
                 # Unexpected success output
                 if output:
-                    print(f"{CYAN} {output}")
+                    print(f"{CYAN} ✅ Saved to Notion: {output}")
                 return True
         elif result:
             error_output = result.stderr.strip() or result.stdout.strip()
@@ -1646,16 +1663,29 @@ def save_profile_to_notion(profile_data: Dict, backend_root: str = None) -> bool
                     print(f"{CYAN} {lines[-1]}")
                 return True
             else:
-                # Real error - but don't spam, just log briefly
-                error_lines = [line for line in error_output.split('\n') if '❌' in line or 'Error' in line]
+                # Real error - show better feedback with emojis
+                error_lines = [line for line in error_output.split('\n') if '❌' in line or 'Error' in line or 'error' in line.lower()]
                 if error_lines:
-                    print(f"{YELLOW} Notion save failed: {error_lines[0]}")
+                    error_msg = error_lines[0]
+                    # Extract profile name if available
+                    profile_name = profile_data.get('name', 'Unknown')
+                    print(f"{RED} ❌ Failed to save {profile_name} to Notion: {error_msg}")
+                else:
+                    # Generic error message
+                    profile_name = profile_data.get('name', 'Unknown')
+                    print(f"{RED} ❌ Failed to save {profile_name} to Notion: {error_output[:200]}")
                 return False
         else:
             return False
                 
     except Exception as e:
-        print(f"{YELLOW} Error saving to Notion: {e}")
+        # Try to get profile name from profile_data if available
+        try:
+            profile_name = profile_data.get('name', 'Unknown') if profile_data else 'Unknown'
+        except:
+            profile_name = 'Unknown'
+        error_msg = str(e)
+        print(f"{RED} ❌ Error saving {profile_name} to Notion: {error_msg}")
         return False
 
 
@@ -1842,7 +1872,7 @@ def save_profile_to_json(profile_data: Dict, json_file: str) -> bool:
 def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1.5,
                     output_format: str = 'json', output_file: str = None, headless: bool = True,
                     location: str = None, no_swipe: bool = False, keep_browser_open: bool = False,
-                    save_to_notion: bool = False):
+                    save_to_notion: bool = False, gender: str = None):
     """
     Scrape Bumble profiles by extracting data before swiping right.
     
@@ -1855,6 +1885,8 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
         headless: Run browser in headless mode (default: True - recommended for automation)
         location: Location to set (e.g., "Seattle" or "Seattle, WA") - optional
         no_swipe: If True, extract data without swiping (default: False - will swipe after extraction)
+        save_to_notion: If True, save each profile to Notion with retry logic
+        gender: Optional gender to set for all scraped profiles (e.g., "female", "male", "non-binary")
     """
     browser = None
     try:
@@ -1864,6 +1896,8 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
         else:
             print(f"{CYAN} Mode: Extract profile data BEFORE swiping right")
         print(f"{CYAN} Headless: {headless}")
+        if gender:
+            print(f"{CYAN} Gender: {gender} (will be set for all scraped profiles)")
         if save_to_notion:
             print(f"{CYAN} Notion saving: ENABLED (each profile saved to JSON backup first, then to Notion with retry logic)")
         else:
@@ -2154,7 +2188,7 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
             print(f"{CYAN} Profile {profile_count + 1}: Extracting data...")
             
             # Extract profile data BEFORE swiping
-            profile_data = extract_profile_data(browser)
+            profile_data = extract_profile_data(browser, gender=gender)
             
             # Create fingerprint for loop detection (even if name is missing)
             # We need to extract partial data to create fingerprint even when name extraction fails
@@ -2366,11 +2400,11 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
                     if json_saved:
                         name_display = profile_data.get('name', 'Unknown')
                         if profile_data.get("_name_placeholder"):
-                            print(f"{CYAN} Saved to JSON backup (placeholder name): {name_display} ({profile_data.get('age', '?')})")
+                            print(f"{CYAN} 💾 Saved to JSON backup (placeholder name): {name_display} ({profile_data.get('age', '?')})")
                         else:
-                            print(f"{CYAN} Saved to JSON backup: {name_display} ({profile_data.get('age', '?')})")
+                            print(f"{CYAN} 💾 Saved to JSON backup: {name_display} ({profile_data.get('age', '?')})")
                     else:
-                        print(f"{YELLOW} Warning: Failed to save {profile_data.get('name', 'Unknown')} to JSON backup")
+                        print(f"{RED} ❌ Failed to save {profile_data.get('name', 'Unknown')} to JSON backup")
                 
                 # STEP 2: Save to Notion if enabled (after JSON backup)
                 notion_saved = False
@@ -2588,6 +2622,8 @@ def main():
                         help='Keep browser open after scraping completes (useful for debugging)')
     parser.add_argument('--save-to-notion', dest='save_to_notion', action='store_true', default=False,
                         help='Save each profile directly to Notion with retry logic (fallback to JSON if fails)')
+    parser.add_argument('--gender', type=str, default=None,
+                        help='Set gender for all scraped profiles (e.g., "female", "male", "non-binary")')
     
     args = parser.parse_args()
     
@@ -2606,7 +2642,8 @@ def main():
         location=args.location,
         no_swipe=args.no_swipe,
         keep_browser_open=args.keep_browser_open,
-        save_to_notion=args.save_to_notion
+        save_to_notion=args.save_to_notion,
+        gender=args.gender
     )
 
 
