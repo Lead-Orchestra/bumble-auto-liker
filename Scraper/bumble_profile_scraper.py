@@ -302,13 +302,41 @@ def extract_profile_data(browser: webdriver.Chrome) -> Optional[Dict]:
             for selector in name_selectors:
                 try:
                     name_elem = browser.find_element(By.CSS_SELECTOR, selector)
-                    name_text = name_elem.text.strip()
+                    # Try textContent first (more reliable than .text)
+                    try:
+                        name_text = browser.execute_script("return arguments[0].textContent;", name_elem).strip()
+                    except:
+                        name_text = name_elem.text.strip()
+                    
                     if name_text and 2 <= len(name_text) <= 50:
                         profile_data["name"] = name_text
                         print(f"{CYAN} Extracted name: {profile_data['name']}")
                         break
                 except:
                     continue
+            
+            # Additional fallback: Try JavaScript extraction from profile_element
+            if not profile_data.get("name"):
+                try:
+                    # Try to find name using JavaScript on the profile element
+                    name_js_selectors = [
+                        ".encounters-story-profile__name",
+                        ".encounters-story-profile__user .encounters-story-profile__name",
+                        "span.encounters-story-profile__name"
+                    ]
+                    for js_selector in name_js_selectors:
+                        try:
+                            name_text = browser.execute_script(
+                                f"var elem = document.querySelector('{js_selector}'); return elem ? elem.textContent.trim() : null;"
+                            )
+                            if name_text and 2 <= len(name_text) <= 50:
+                                profile_data["name"] = name_text
+                                print(f"{CYAN} Extracted name (JavaScript fallback): {profile_data['name']}")
+                                break
+                        except:
+                            continue
+                except Exception as e:
+                    print(f"{YELLOW} JavaScript name extraction fallback failed: {e}")
             
             # Extract age
             for selector in age_selectors:
@@ -330,12 +358,17 @@ def extract_profile_data(browser: webdriver.Chrome) -> Optional[Dict]:
             # Fallback: try regex on article text if direct selectors failed
             if not profile_data.get("name") or not profile_data.get("age"):
                 import re
-                article_text = profile_element.text
+                # Try both .text and JavaScript textContent for article text
+                try:
+                    article_text = browser.execute_script("return arguments[0].textContent;", profile_element)
+                except:
+                    article_text = profile_element.text
                 
                 # Try to find name/age pattern in text (e.g., "Kristine, 28")
                 name_age_patterns = [
                     r'^([^\n,]+?)\s*,\s*(\d{2})\b',  # Start: "Name, 28"
                     r'([A-Z][a-zA-Z]+)\s*,\s*(\d{2})\b',  # Simple: "Name, 28"
+                    r'^([A-Z][a-z]+)\s+(\d{2})\b',  # "Name 28" (no comma)
                 ]
                 
                 for pattern in name_age_patterns:
@@ -343,14 +376,16 @@ def extract_profile_data(browser: webdriver.Chrome) -> Optional[Dict]:
                     if match:
                         name = match.group(1).strip()
                         name = re.sub(r'\s+', ' ', name).strip()
-                        age = int(match.group(2))
-                        if 2 <= len(name) <= 50 and 18 <= age <= 99:
-                            if not profile_data.get("name"):
-                                profile_data["name"] = name
-                            if not profile_data.get("age"):
-                                profile_data["age"] = age
-                            print(f"{CYAN} Extracted name/age (fallback): {profile_data.get('name')}, {profile_data.get('age')}")
-                            break
+                        # Remove common non-name words
+                        if name.lower() not in ['age', 'years', 'old', 'profile', 'about']:
+                            age = int(match.group(2))
+                            if 2 <= len(name) <= 50 and 18 <= age <= 99:
+                                if not profile_data.get("name"):
+                                    profile_data["name"] = name
+                                if not profile_data.get("age"):
+                                    profile_data["age"] = age
+                                print(f"{CYAN} Extracted name/age (regex fallback): {profile_data.get('name')}, {profile_data.get('age')}")
+                                break
         except Exception as e:
             print(f"{YELLOW} Error extracting name/age: {e}")
             # Don't set name/age to None - let validation handle it
@@ -1010,11 +1045,59 @@ def extract_profile_data(browser: webdriver.Chrome) -> Optional[Dict]:
             except:
                 pass
         
-        # Validate that we have at least a name (required)
+        # Create fingerprint BEFORE name validation (for loop detection even when name is missing)
+        # This allows us to detect loops even when name extraction fails
+        profile_fingerprint = create_profile_fingerprint(profile_data)
+        profile_data["_fingerprint"] = profile_fingerprint  # Store fingerprint for loop detection
+        
+        # Final attempt: Try to extract name from the entire article text using regex
+        if not profile_data.get("name"):
+            try:
+                import re
+                # Get full article text
+                try:
+                    article_text = browser.execute_script("return arguments[0].textContent;", profile_element)
+                except:
+                    article_text = profile_element.text
+                
+                # Look for name patterns at the start of the text
+                # Common patterns: "Name, 28" or "Name 28" or just "Name" at the beginning
+                name_patterns = [
+                    r'^([A-Z][a-z]{2,20})\s*,?\s*\d{2}',  # "Name, 28" or "Name 28"
+                    r'^([A-Z][a-z]{2,20})\s+',  # "Name " at start
+                    r'([A-Z][a-z]{2,20})\s*,\s*\d{2}',  # "Name, 28" anywhere
+                ]
+                
+                for pattern in name_patterns:
+                    match = re.search(pattern, article_text, re.MULTILINE)
+                    if match:
+                        potential_name = match.group(1).strip()
+                        # Filter out common non-name words
+                        if (potential_name.lower() not in ['age', 'years', 'old', 'profile', 'about', 'lives', 'from', 
+                                                           'seattle', 'washington', 'denver', 'colorado', 'woman', 'man',
+                                                           'relationship', 'never', 'sometimes', 'frequently', 'socially'] and
+                            2 <= len(potential_name) <= 30):
+                            profile_data["name"] = potential_name
+                            print(f"{CYAN} Extracted name (final regex attempt): {profile_data['name']}")
+                            break
+            except Exception as e:
+                print(f"{YELLOW} Final name extraction attempt failed: {e}")
+        
+        # If still no name, generate a placeholder name from available data
         profile_name = profile_data.get("name")
         if not profile_name or not isinstance(profile_name, str) or not profile_name.strip() or profile_name.lower() in ['none', 'null', 'undefined']:
-            print(f"{YELLOW} Warning: Could not extract valid name from profile - returning None")
-            return None
+            # Generate placeholder name from age and location
+            age = profile_data.get("age", "?")
+            location = profile_data.get("location", "Unknown")
+            # Extract city name from location (e.g., "Seattle, Washington" -> "Seattle")
+            city = location.split(',')[0].strip() if location and ',' in location else location
+            profile_data["name"] = f"Unknown_{age}_{city}".replace(' ', '_')[:50]
+            profile_data["_name_placeholder"] = True  # Flag to indicate this is a placeholder
+            print(f"{YELLOW} Warning: Could not extract name - using placeholder: {profile_data['name']}")
+            print(f"{YELLOW} Debug: Extracted fields: {[k for k in profile_data.keys() if k not in ['extracted_at', '_fingerprint', '_name_placeholder']]}")
+        
+        # Remove fingerprint from profile_data before returning (it's internal)
+        profile_data.pop("_fingerprint", None)
         
         # Print extracted data summary
         print(f"{GREEN} Profile extracted: {profile_data.get('name', 'Unknown')} ({profile_data.get('age', '?')})")
@@ -1495,7 +1578,8 @@ def save_profile_to_notion(profile_data: Dict, backend_root: str = None) -> bool
         if not backend_root:
             current_dir = Path(__file__).resolve()
             # Go up: Scraper -> bumble-auto-liker -> submodules -> backend
-            backend_root = current_dir.parent.parent.parent
+            # Path structure: backend/submodules/bumble-auto-liker/Scraper/bumble_profile_scraper.py
+            backend_root = current_dir.parent.parent.parent.parent
         
         script_path = Path(backend_root) / 'scripts' / 'save-bumble-profile-to-notion.ts'
         
@@ -1573,6 +1657,152 @@ def save_profile_to_notion(profile_data: Dict, backend_root: str = None) -> bool
     except Exception as e:
         print(f"{YELLOW} Error saving to Notion: {e}")
         return False
+
+
+def create_profile_fingerprint(profile_data: Dict) -> str:
+    """
+    Create a unique fingerprint for a profile based on extracted data.
+    Used to detect when we're extracting the same profile repeatedly.
+    
+    Args:
+        profile_data: Dictionary containing extracted profile data
+        
+    Returns:
+        A string fingerprint representing the profile
+    """
+    try:
+        # Extract key identifying features
+        age = profile_data.get("age", "unknown")
+        location = profile_data.get("location", "unknown")
+        
+        # Sort badges for consistent fingerprinting
+        badges = sorted(profile_data.get("badges", [])) if isinstance(profile_data.get("badges"), list) else []
+        badges_str = ",".join(badges)
+        
+        # Use question answer keys (not values, as they might vary)
+        qa_keys = sorted(profile_data.get("question_answers", {}).keys()) if isinstance(profile_data.get("question_answers"), dict) else []
+        qa_keys_str = ",".join(qa_keys)
+        
+        # Image URLs count
+        image_count = len(profile_data.get("image_urls", [])) if isinstance(profile_data.get("image_urls"), list) else 0
+        
+        # Create fingerprint
+        fingerprint_parts = [
+            f"age:{age}",
+            f"loc:{location}",
+            f"badges:{badges_str}",
+            f"qa:{qa_keys_str}",
+            f"imgs:{image_count}"
+        ]
+        
+        return "|".join(fingerprint_parts)
+    except Exception as e:
+        print(f"{YELLOW} Error creating profile fingerprint: {e}")
+        return "error"
+
+
+def save_stuck_profile_html(browser: webdriver.Chrome, profile_count: int) -> str:
+    """
+    Save the current browser page HTML to a file for debugging stuck profiles.
+    
+    Args:
+        browser: Selenium WebDriver instance
+        profile_count: Current profile count for filename
+        
+    Returns:
+        Path to the saved HTML file
+    """
+    try:
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"bumble_stuck_profile_{timestamp}_profile{profile_count}.html"
+        
+        # Get page source
+        page_source = browser.page_source
+        
+        # Save to file
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(page_source)
+        
+        print(f"{YELLOW} Saved stuck profile HTML to: {filename}")
+        return filename
+    except Exception as e:
+        print(f"{YELLOW} Error saving stuck profile HTML: {e}")
+        return ""
+
+
+def restart_browser(browser: webdriver.Chrome, cookie_file: str = None, headless: bool = True, 
+                    location: str = None, chrome_version: int = None) -> webdriver.Chrome:
+    """
+    Restart the browser by closing the current instance and creating a new one.
+    Reloads cookies and sets location if provided.
+    
+    Args:
+        browser: Current browser instance to close
+        cookie_file: Path to cookie file to reload
+        headless: Whether to run in headless mode
+        location: Location to set after restart
+        chrome_version: Chrome version to use
+        
+    Returns:
+        New browser instance
+    """
+    try:
+        print(f"{CYAN} Restarting browser...")
+        
+        # Close current browser
+        try:
+            browser.quit()
+        except Exception as e:
+            print(f"{YELLOW} Error closing browser: {e}")
+        
+        # Wait a bit before restarting
+        time.sleep(2)
+        
+        # Reinitialize browser using existing logic
+        def create_chrome_options():
+            """Create a new ChromeOptions object (cannot be reused)"""
+            options = uc.ChromeOptions()
+            if headless:
+                options.add_argument('--headless=new')
+            options.add_argument('--no-sandbox')
+            options.add_argument('--disable-dev-shm-usage')
+            options.add_argument('--disable-blink-features=AutomationControlled')
+            options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+            return options
+        
+        # Create new browser instance
+        if chrome_version:
+            options = create_chrome_options()
+            new_browser = uc.Chrome(options=options, version_main=chrome_version, headless=headless, use_subprocess=True)
+        else:
+            options = create_chrome_options()
+            new_browser = uc.Chrome(options=options, version_main=None, headless=headless, use_subprocess=True)
+        
+        print(f"{GREEN} Browser restarted successfully")
+        
+        # Navigate to app
+        new_browser.get("https://www.bumble.com/app")
+        time.sleep(3)
+        
+        # Reload cookies if provided
+        if cookie_file:
+            cookies = load_cookies_from_file(cookie_file)
+            if cookies:
+                if inject_cookies_to_browser(new_browser, cookies):
+                    print(f"{GREEN} Cookies reloaded successfully")
+                    # Refresh page after cookies
+                    new_browser.get("https://www.bumble.com/app")
+                    time.sleep(3)
+        
+        # Set location if provided
+        if location:
+            set_location(new_browser, location)
+        
+        return new_browser
+        
+    except Exception as e:
+        print(f"{RED} Error restarting browser: {e}")
+        raise
 
 
 def save_profile_to_json(profile_data: Dict, json_file: str) -> bool:
@@ -1875,6 +2105,12 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
         consecutive_failures = 0
         max_consecutive_failures = 3  # Stop after 3 consecutive failures
         
+        # Loop detection: Track recent profile fingerprints to detect infinite loops
+        recent_profile_fingerprints = []
+        max_loop_detection_count = 3  # Number of same fingerprints before restart
+        max_restarts = 3  # Maximum browser restarts per session
+        restart_count = 0
+        
         # Initialize JSON file path for incremental saving (backup)
         json_backup_file = None
         if output_format == 'json':
@@ -1903,6 +2139,117 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
             
             # Extract profile data BEFORE swiping
             profile_data = extract_profile_data(browser)
+            
+            # Create fingerprint for loop detection (even if name is missing)
+            # We need to extract partial data to create fingerprint even when name extraction fails
+            current_fingerprint = None
+            if profile_data:
+                # Profile data is valid (has name)
+                current_fingerprint = profile_data.get("_fingerprint") or create_profile_fingerprint(profile_data)
+            else:
+                # Profile data is None (name missing), but we still need to detect loops
+                # Try to extract partial data for fingerprinting
+                try:
+                    # Quick extraction of key fields for fingerprinting
+                    partial_data = {}
+                    try:
+                        age_elem = browser.find_element(By.CSS_SELECTOR, '.encounters-story-profile__age')
+                        age_text = age_elem.text.strip()
+                        import re
+                        age_match = re.search(r'(\d{2})', age_text)
+                        if age_match:
+                            partial_data["age"] = int(age_match.group(1))
+                    except:
+                        pass
+                    
+                    try:
+                        location_elem = browser.find_element(By.CSS_SELECTOR, '.location-widget__town')
+                        partial_data["location"] = location_elem.text.strip() if location_elem else None
+                    except:
+                        pass
+                    
+                    try:
+                        badge_elems = browser.find_elements(By.CSS_SELECTOR, '.encounters-story-about__badge .pill__title')
+                        partial_data["badges"] = [badge.text.strip() for badge in badge_elems if badge.text.strip()]
+                    except:
+                        pass
+                    
+                    try:
+                        # Extract question titles (keys) for fingerprinting
+                        qa_sections = browser.find_elements(By.CSS_SELECTOR, '.encounters-story-section--question')
+                        qa_dict = {}
+                        for section in qa_sections:
+                            try:
+                                question_title_elem = section.find_element(By.CSS_SELECTOR, '.encounters-story-section__heading-title h2, .encounters-story-section__heading-title')
+                                question_title = question_title_elem.text.strip() if question_title_elem else None
+                                if not question_title:
+                                    question_title = browser.execute_script("return arguments[0].textContent || arguments[0].innerText || '';", question_title_elem)
+                                    question_title = question_title.strip() if question_title else None
+                                if question_title:
+                                    qa_dict[question_title] = "exists"
+                            except:
+                                pass
+                        if qa_dict:
+                            partial_data["question_answers"] = qa_dict
+                    except Exception as e:
+                        print(f"{YELLOW} Error extracting question answers for fingerprint: {e}")
+                        pass
+                    
+                    try:
+                        img_elems = browser.find_elements(By.CSS_SELECTOR, '.encounters-album__photo img')
+                        partial_data["image_urls"] = [img.get_attribute('src') for img in img_elems[:3] if img.get_attribute('src')]
+                    except:
+                        pass
+                    
+                    if partial_data:
+                        current_fingerprint = create_profile_fingerprint(partial_data)
+                        print(f"{CYAN} Created fingerprint from partial data (name missing): {current_fingerprint[:80]}...")
+                        print(f"{CYAN} Recent fingerprints count: {len(recent_profile_fingerprints)}")
+                    else:
+                        print(f"{YELLOW} Warning: Could not extract any partial data for fingerprinting")
+                except Exception as e:
+                    print(f"{YELLOW} Could not create fingerprint from partial data: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            # Check for infinite loop: same profile extracted repeatedly
+            if current_fingerprint:
+                print(f"{CYAN} Current fingerprint: {current_fingerprint[:80]}...")
+                print(f"{CYAN} Recent fingerprints: {[fp[:40] + '...' if len(fp) > 40 else fp for fp in recent_profile_fingerprints[-3:]]}")
+                if len(recent_profile_fingerprints) >= max_loop_detection_count:
+                    # Check if last N fingerprints are the same
+                    recent_same = all(fp == current_fingerprint for fp in recent_profile_fingerprints[-max_loop_detection_count:])
+                    if recent_same:
+                        print(f"{RED} ERROR: Infinite loop detected - same profile extracted {max_loop_detection_count} times consecutively")
+                        print(f"{YELLOW} Fingerprint: {current_fingerprint}")
+                        
+                        # Save HTML for debugging
+                        html_file = save_stuck_profile_html(browser, profile_count)
+                        
+                        # Restart browser if enabled and under limit
+                        if restart_count < max_restarts:
+                            restart_count += 1
+                            print(f"{CYAN} Attempting browser restart ({restart_count}/{max_restarts})...")
+                            try:
+                                browser = restart_browser(browser, cookie_file, headless, location, chrome_version)
+                                # Clear fingerprint history after restart
+                                recent_profile_fingerprints = []
+                                consecutive_failures = 0
+                                print(f"{GREEN} Browser restarted successfully, continuing...")
+                                time.sleep(5)  # Wait for page to load
+                                continue  # Skip to next iteration
+                            except Exception as e:
+                                print(f"{RED} Browser restart failed: {e}")
+                                print(f"{YELLOW} Stopping scraper to prevent infinite restart loop")
+                                break
+                        else:
+                            print(f"{RED} Maximum restart limit ({max_restarts}) reached. Stopping scraper.")
+                            break
+                
+                # Add current fingerprint to recent list (keep last 5)
+                recent_profile_fingerprints.append(current_fingerprint)
+                if len(recent_profile_fingerprints) > 5:
+                    recent_profile_fingerprints.pop(0)
             
             if not profile_data:
                 consecutive_failures += 1
@@ -1987,15 +2334,19 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
             # Reset failure counter on successful extraction
             consecutive_failures = 0
             
-            # Only add profile data if it has a valid name
-            profile_name = profile_data.get("name")
-            if profile_name and profile_name.strip() and profile_name.lower() not in ['none', 'null', 'undefined']:
+            # Profile data should now always have a name (either extracted or placeholder)
+            # Save profile data (name should be present at this point)
+            if profile_data and profile_data.get("name"):
                 # STEP 1: Save to JSON immediately (backup) - ALWAYS do this first
                 json_saved = False
                 if json_backup_file:
                     json_saved = save_profile_to_json(profile_data, json_backup_file)
                     if json_saved:
-                        print(f"{CYAN} Saved to JSON backup: {profile_data.get('name', 'Unknown')} ({profile_data.get('age', '?')})")
+                        name_display = profile_data.get('name', 'Unknown')
+                        if profile_data.get("_name_placeholder"):
+                            print(f"{CYAN} Saved to JSON backup (placeholder name): {name_display} ({profile_data.get('age', '?')})")
+                        else:
+                            print(f"{CYAN} Saved to JSON backup: {name_display} ({profile_data.get('age', '?')})")
                     else:
                         print(f"{YELLOW} Warning: Failed to save {profile_data.get('name', 'Unknown')} to JSON backup")
                 
@@ -2011,9 +2362,13 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
                 
                 if not save_to_notion and not json_backup_file:
                     # Only print extraction message if neither Notion nor JSON backup is enabled
-                    print(f"{GREEN} Extracted: {profile_data.get('name', 'Unknown')} ({profile_data.get('age', '?')})")
+                    name_display = profile_data.get('name', 'Unknown')
+                    if profile_data.get("_name_placeholder"):
+                        print(f"{GREEN} Extracted (placeholder name): {name_display} ({profile_data.get('age', '?')})")
+                    else:
+                        print(f"{GREEN} Extracted: {name_display} ({profile_data.get('age', '?')})")
             else:
-                print(f"{YELLOW} Warning: Profile data incomplete (missing or invalid name) - skipping and moving to next profile")
+                print(f"{RED} ERROR: Profile data is None or missing name - this should not happen after placeholder generation")
                 consecutive_failures += 1
                 # Don't add incomplete profiles to the list
                 # Swipe/click to move to next profile instead of retrying the same one
