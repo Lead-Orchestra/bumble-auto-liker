@@ -1762,8 +1762,9 @@ def restart_browser(browser: webdriver.Chrome, cookie_file: str = None, headless
         def create_chrome_options():
             """Create a new ChromeOptions object (cannot be reused)"""
             options = uc.ChromeOptions()
+            # Incremental fix 3: Use --headless=old instead of --headless=new (more reliable on Windows)
             if headless:
-                options.add_argument('--headless=new')
+                options.add_argument('--headless=old')
             options.add_argument('--no-sandbox')
             options.add_argument('--disable-dev-shm-usage')
             options.add_argument('--disable-blink-features=AutomationControlled')
@@ -1773,10 +1774,12 @@ def restart_browser(browser: webdriver.Chrome, cookie_file: str = None, headless
         # Create new browser instance
         if chrome_version:
             options = create_chrome_options()
-            new_browser = uc.Chrome(options=options, version_main=chrome_version, headless=headless, use_subprocess=True)
+            # Incremental fix 2: Disable use_subprocess when headless (may interfere with headless mode)
+            new_browser = uc.Chrome(options=options, version_main=chrome_version, headless=headless, use_subprocess=not headless)
         else:
             options = create_chrome_options()
-            new_browser = uc.Chrome(options=options, version_main=None, headless=headless, use_subprocess=True)
+            # Incremental fix 2: Disable use_subprocess when headless (may interfere with headless mode)
+            new_browser = uc.Chrome(options=options, version_main=None, headless=headless, use_subprocess=not headless)
         
         print(f"{GREEN} Browser restarted successfully")
         
@@ -1869,8 +1872,9 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
         def create_chrome_options():
             """Create a new ChromeOptions object (cannot be reused)"""
             options = uc.ChromeOptions()
+            # Use --headless=old instead of --headless=new (more reliable on Windows)
             if headless:
-                options.add_argument('--headless=new')
+                options.add_argument('--headless=old')
             options.add_argument('--no-sandbox')
             options.add_argument('--disable-dev-shm-usage')
             options.add_argument('--disable-blink-features=AutomationControlled')
@@ -1879,7 +1883,11 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
         
         # Create undetected Chrome driver (undetected-chromedriver handles anti-detection automatically)
         # Let undetected-chromedriver auto-detect and download the correct ChromeDriver version
+        # Note: This scraper uses Chrome regardless of where cookies came from (Firefox/Chrome/etc)
+        # Cookies are browser-agnostic HTTP cookies, so Firefox cookies work fine in Chrome
         print(f"{CYAN} Starting browser...")
+        if headless:
+            print(f"{CYAN} Running in headless mode (no visible browser window)")
         print(f"{CYAN} Auto-detecting Chrome version and downloading compatible ChromeDriver...")
         
         # Try to detect Chrome version first to ensure we get the right ChromeDriver
@@ -1909,8 +1917,12 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
                         ]
                         for chrome_path in chrome_paths:
                             if os.path.exists(chrome_path):
+                                # Fix: Add headless arguments to prevent Chrome from opening visibly during version detection
+                                version_args = [chrome_path, '--version']
+                                if headless:
+                                    version_args.extend(['--headless=old', '--disable-gpu', '--no-sandbox'])
                                 result = subprocess.run(
-                                    [chrome_path, '--version'],
+                                    version_args,
                                     capture_output=True, text=True, timeout=5
                                 )
                                 if result.returncode == 0:
@@ -1930,11 +1942,13 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
             if chrome_version:
                 print(f"{CYAN} Using detected Chrome version: {chrome_version}")
                 options = create_chrome_options()
-                browser = uc.Chrome(options=options, version_main=chrome_version, headless=headless, use_subprocess=True)
+                # Disable use_subprocess when headless (may interfere with headless mode)
+                browser = uc.Chrome(options=options, version_main=chrome_version, headless=headless, use_subprocess=not headless)
             else:
                 print(f"{CYAN} Using auto-detection for Chrome version...")
                 options = create_chrome_options()
-                browser = uc.Chrome(options=options, version_main=None, headless=headless, use_subprocess=True)
+                # Disable use_subprocess when headless (may interfere with headless mode)
+                browser = uc.Chrome(options=options, version_main=None, headless=headless, use_subprocess=not headless)
         except Exception as e:
             error_msg = str(e)
             print(f"{YELLOW} Initial browser initialization failed: {error_msg[:300]}")
@@ -1951,7 +1965,8 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
                         chrome_version = actual_chrome_version
                         print(f"{CYAN} Retrying with correct Chrome version: {chrome_version}")
                         options = create_chrome_options()
-                        browser = uc.Chrome(options=options, version_main=chrome_version, headless=headless, use_subprocess=True)
+                        # Incremental fix 2: Disable use_subprocess when headless (may interfere with headless mode)
+                        browser = uc.Chrome(options=options, version_main=chrome_version, headless=headless, use_subprocess=not headless)
                     else:
                         raise
                 else:
@@ -2104,6 +2119,7 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
         profile_count = 0
         consecutive_failures = 0
         max_consecutive_failures = 3  # Stop after 3 consecutive failures
+        daily_limit_hit = False  # Track if we hit the daily limit gracefully
         
         # Loop detection: Track recent profile fingerprints to detect infinite loops
         recent_profile_fingerprints = []
@@ -2266,11 +2282,13 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
                             if 'end of the line' in title_text or 'hit the end' in title_text:
                                 print(f"{CYAN} Daily swipe limit reached: 'You've hit the end of the line — for today!'")
                                 print(f"{CYAN} Successfully extracted {profile_count} profile(s) before hitting limit")
+                                daily_limit_hit = True
                                 break
                         except:
                             # If we found the blocker element, it's likely the limit
                             print(f"{CYAN} Daily swipe limit detected (encounters-blocker-vote-quota)")
                             print(f"{CYAN} Successfully extracted {profile_count} profile(s) before hitting limit")
+                            daily_limit_hit = True
                             break
                 except NoSuchElementException:
                     pass  # Blocker not found, continue with other checks
@@ -2287,6 +2305,10 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
                     'upgrade to bumble boost', 'wait until tomorrow'
                 ]
                 if any(indicator in page_source for indicator in end_indicators):
+                    # Check if it's a daily limit (vote quota, end of the line)
+                    if any(indicator in page_source for indicator in ['end of the line', 'hit the end', 'vote quota', 'wait until tomorrow']):
+                        daily_limit_hit = True
+                        print(f"{CYAN} Daily limit detected in page content")
                     print(f"{CYAN} No more profiles available (detected end state)")
                     if profile_count > 0:
                         print(f"{CYAN} Successfully extracted {profile_count} profile(s) before stopping")
@@ -2423,8 +2445,12 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
         
         # Save all profiles
         if not all_profiles:
-            print(f"{RED} Error: No profiles extracted")
-            sys.exit(1)
+            if daily_limit_hit:
+                print(f"{CYAN} Daily limit reached before extracting any profiles - exiting gracefully")
+                sys.exit(0)
+            else:
+                print(f"{RED} Error: No profiles extracted")
+                sys.exit(1)
         
         print(f"{GREEN} Successfully extracted {len(all_profiles)} profile(s)")
         
