@@ -483,6 +483,35 @@ def extract_profile_data(browser: webdriver.Chrome, gender: str = None) -> Optio
             print(f"{YELLOW} Error extracting bio: {e}")
             profile_data["bio"] = None
         
+        # Extract social handles from bio
+        if profile_data.get("bio"):
+            try:
+                import re
+                bio_lower = profile_data["bio"].lower()
+                
+                # Instagram
+                ig_pattern = r'(?:ig|insta|instagram|📷|📸)\s*:?\s*@?([a-zA-Z0-9._]{3,30})'
+                ig_match = re.search(ig_pattern, bio_lower)
+                if ig_match:
+                    profile_data["instagram"] = ig_match.group(1)
+                    print(f"{CYAN} Extracted Instagram: {profile_data['instagram']}")
+                
+                # Snapchat
+                snap_pattern = r'(?:sc|snap|snapchat|👻)\s*:?\s*@?([a-zA-Z0-9._\-]{3,30})'
+                snap_match = re.search(snap_pattern, bio_lower)
+                if snap_match:
+                    profile_data["snapchat"] = snap_match.group(1)
+                    print(f"{CYAN} Extracted Snapchat: {profile_data['snapchat']}")
+                
+                # TikTok
+                tiktok_pattern = r'(?:tt|tiktok)\s*:?\s*@?([a-zA-Z0-9._]{3,30})'
+                tiktok_match = re.search(tiktok_pattern, bio_lower)
+                if tiktok_match:
+                    profile_data["tiktok"] = tiktok_match.group(1)
+                    print(f"{CYAN} Extracted TikTok: {profile_data['tiktok']}")
+            except Exception as e:
+                print(f"{YELLOW} Error extracting social handles: {e}")
+        
         # Extract job/profession - look for "Senior Designer at Corporate Event Planning" pattern
         # Also check encounters-story-about badges which contain job info
         try:
@@ -1673,7 +1702,7 @@ def set_location(browser: webdriver.Chrome, location: str) -> bool:
         return False
 
 
-def save_profile_to_notion(profile_data: Dict, backend_root: str = None) -> bool:
+def save_profile_to_notion(profile_data: Dict, backend_root: str = None, merge_duplicates: bool = False) -> bool:
     """
     Save a profile to Notion using the Node.js script with retry logic.
     Returns True if successful, False otherwise.
@@ -1699,6 +1728,11 @@ def save_profile_to_notion(profile_data: Dict, backend_root: str = None) -> bool
         # Use pnpm or node directly
         result = None
         try:
+            # Prepare environment variables
+            env_vars = os.environ.copy()
+            if merge_duplicates:
+                env_vars['NOTION_UPDATE_DUPLICATES'] = 'true'
+
             # Try pnpm first (if available)
             result = subprocess.run(
                 ['pnpm', 'tsx', str(script_path)],
@@ -1709,11 +1743,15 @@ def save_profile_to_notion(profile_data: Dict, backend_root: str = None) -> bool
                 capture_output=True,
                 timeout=60,  # Increased timeout for retry logic
                 cwd=str(backend_root),
-                env=os.environ.copy()  # Pass environment variables (including NOTION_TOKEN)
+                env=env_vars  # Pass environment variables (including NOTION_TOKEN)
             )
         except FileNotFoundError:
             # Fallback to npx with tsx
             try:
+                env_vars = os.environ.copy()
+                if merge_duplicates:
+                    env_vars['NOTION_UPDATE_DUPLICATES'] = 'true'
+                    
                 result = subprocess.run(
                     ['npx', 'tsx', str(script_path)],
                     input=profile_json,
@@ -1723,7 +1761,7 @@ def save_profile_to_notion(profile_data: Dict, backend_root: str = None) -> bool
                     capture_output=True,
                     timeout=60,
                     cwd=str(backend_root),
-                    env=os.environ.copy()
+                    env=env_vars
                 )
             except FileNotFoundError:
                 print(f"{YELLOW} ⚠️  Could not execute Notion save script (pnpm/npx not found), skipping Notion save")
@@ -2004,7 +2042,8 @@ def scrape_worker(worker_id, total_workers, args_dict):
             save_to_notion=args_dict.get('save_to_notion', False),
             gender=args_dict.get('gender'),
             dislike=args_dict.get('dislike', False),
-            upload_images=args_dict.get('upload_images', False)
+            upload_images=args_dict.get('upload_images', False),
+            merge_duplicates=args_dict.get('merge_duplicates', False)
         )
         print(f"{GREEN} [Worker {worker_id}] Completed successfully.")
         return True
@@ -2019,7 +2058,7 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
                     output_format: str = 'json', output_file: str = None, headless: bool = True,
                     location: str = None, no_swipe: bool = False, keep_browser_open: bool = False,
                     save_to_notion: bool = False, gender: str = None, dislike: bool = False,
-                    upload_images: bool = False):
+                    upload_images: bool = False, merge_duplicates: bool = False):
     """
     Scrape Bumble profiles by extracting data before swiping right.
     
@@ -2582,7 +2621,7 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
                 # STEP 2: Save to Notion if enabled (after JSON backup)
                 notion_saved = False
                 if save_to_notion:
-                    notion_saved = save_profile_to_notion(profile_data)
+                    notion_saved = save_profile_to_notion(profile_data, merge_duplicates=merge_duplicates)
                     # Note: save_profile_to_notion already prints status messages
                 
                 # Always add to list for final JSON save (redundancy)
@@ -2805,6 +2844,8 @@ def main():
                         help='Swipe left (dislike/pass) instead of swiping right (like)')
     parser.add_argument('--upload-images', dest='upload_images', action='store_true', default=False,
                         help='Upload profile images to S3 for permanent storage (requires boto3 and AWS credentials)')
+    parser.add_argument('--merge-duplicates', dest='merge_duplicates', action='store_true', default=False,
+                        help='Update existing profiles in Notion if duplicates are found (default: skip)')
     parser.add_argument('--workers', type=int, default=1,
                         help='Number of browser instances to run in parallel (default: 1)')
     parser.add_argument('--stagger', type=int, default=5,
@@ -2854,7 +2895,8 @@ def main():
             save_to_notion=args.save_to_notion,
             gender=args.gender,
             dislike=args.dislike,
-            upload_images=args.upload_images
+            upload_images=args.upload_images,
+            merge_duplicates=args.merge_duplicates
         )
 
 
