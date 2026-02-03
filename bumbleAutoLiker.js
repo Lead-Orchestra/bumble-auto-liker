@@ -1,5 +1,5 @@
 //https://github.com/amitoj-singh/bumble-auto-liker/
-(function () {
+(() => {
 	// Ask the user for the number of likes to send
 	const numberOfLikes = parseInt(prompt('How many likes would you like to send?'), 10);
 
