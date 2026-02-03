@@ -9,7 +9,8 @@ Similar to Tinder extract_tinder_cookies.py
 
 from argparse import ArgumentParser
 from glob import glob
-from os.path import expanduser, exists
+from os.path import expanduser, exists, join
+import os
 from platform import system
 from sqlite3 import OperationalError, connect
 import json
@@ -301,7 +302,7 @@ def extract_cookies_from_chrome_edge(cookiefile):
     return None
 
 
-def extract_bumble_cookies(browser=None, output_file='bumble_cookies.json', quiet=False):
+def extract_bumble_cookies(browser=None, output_file='bumble_cookies.json', quiet=False, firefox_profile_path=None):
     """
     Extract Bumble cookies from browser cookie databases.
     
@@ -309,6 +310,7 @@ def extract_bumble_cookies(browser=None, output_file='bumble_cookies.json', quie
         browser: Preferred browser ('firefox', 'chrome', 'edge') or None to try all
         output_file: Output file path for cookies JSON
         quiet: Suppress verbose output
+        firefox_profile_path: Explict path to Firefox profile directory
     """
     if not quiet:
         print(f"{CYAN} Extracting Bumble cookies from browser...")
@@ -320,7 +322,25 @@ def extract_bumble_cookies(browser=None, output_file='bumble_cookies.json', quie
     if not browser or browser.lower() == 'firefox':
         if not quiet:
             print(f"{CYAN} Trying Firefox...")
-        firefox_files = get_firefox_cookie_files()
+        
+        firefox_files = []
+        if firefox_profile_path:
+            # Use explicitly provided profile
+            if exists(firefox_profile_path):
+                # Search for cookies.sqlite in the provided directory
+                if firefox_profile_path.endswith('cookies.sqlite'):
+                     firefox_files = [firefox_profile_path]
+                else:
+                     firefox_files = glob(os.path.join(firefox_profile_path, 'cookies.sqlite'))
+                
+                if not firefox_files and not quiet:
+                     print(f"{YELLOW} No cookies.sqlite found in provided profile path: {firefox_profile_path}")
+            else:
+                if not quiet:
+                    print(f"{RED} Provided Firefox profile path does not exist: {firefox_profile_path}")
+        else:
+            # Auto-discover
+            firefox_files = get_firefox_cookie_files()
         if firefox_files:
             if not quiet:
                 print(f"{CYAN} Found {len(firefox_files)} Firefox profile(s)")
@@ -442,6 +462,8 @@ def main():
     parser = ArgumentParser(description='Extract Bumble cookies from browser cookie databases')
     parser.add_argument('--browser', choices=['firefox', 'chrome', 'edge'],
                         help='Preferred browser for cookie extraction (default: try all)')
+    parser.add_argument('--firefox-profile', 
+                        help='Specific Firefox profile directory path (optional, overrides auto-discovery)')
     parser.add_argument('-o', '--output', default='bumble_cookies.json',
                         help='Output file path for cookies JSON (default: bumble_cookies.json)')
     parser.add_argument('--quiet', '-q', action='store_true',
@@ -452,7 +474,8 @@ def main():
     extract_bumble_cookies(
         browser=args.browser,
         output_file=args.output,
-        quiet=args.quiet
+        quiet=args.quiet,
+        firefox_profile_path=args.firefox_profile
     )
 
 

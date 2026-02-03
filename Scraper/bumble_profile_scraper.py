@@ -130,14 +130,28 @@ def inject_cookies_to_browser(browser: webdriver.Chrome, cookies: List[Dict]) ->
         
         print(f"{GREEN} Injected {injected_count} cookies")
         
-        # Refresh page to apply cookies
-        print(f"{CYAN} Refreshing page to apply cookies...")
-        browser.refresh()
-        time.sleep(3)
+        # Verify cookies in browser immediately
+        browser_cookies = browser.get_cookies()
+        browser_cookie_names = [c['name'] for c in browser_cookies]
+        print(f"{CYAN} Browser has {len(browser_cookies)} cookies after injection")
+        
+        important_cookies = ['session', 'BumbleID', 'sessionid', 'access_token', 'bumble_session']
+        found_important = [name for name in important_cookies if name in browser_cookie_names]
+        
+        if found_important:
+             print(f"{GREEN} Verified authentication cookies in browser: {', '.join(found_important)}")
+        else:
+             print(f"{YELLOW} Warning: key authentication cookies not found in browser after injection")
+             print(f"{YELLOW} Browser has: {', '.join(browser_cookie_names[:10])}...")
+        
+        # Navigate to app page to apply cookies and verify session
+        print(f"{CYAN} Navigating to Bumble App to verify session...")
+        browser.get("https://bumble.com/app")
+        time.sleep(5)
         
         # Check final URL
         final_url = browser.current_url
-        print(f"{CYAN} Final URL after refresh: {final_url}")
+        print(f"{CYAN} Final URL after navigation: {final_url}")
         
         # Check if we're logged in (Bumble redirects to app.bumble.com or shows profile cards)
         if 'app.bumble.com' in final_url or 'bumble.com/app' in final_url:
@@ -2205,7 +2219,7 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
                     try:
                         age_elem = browser.find_element(By.CSS_SELECTOR, '.encounters-story-profile__age')
                         age_text = age_elem.text.strip()
-                        import re
+                        # import re # Already imported globally
                         age_match = re.search(r'(\d{2})', age_text)
                         if age_match:
                             partial_data["age"] = int(age_match.group(1))
