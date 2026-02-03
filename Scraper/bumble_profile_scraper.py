@@ -1213,6 +1213,87 @@ def swipe_right(browser: webdriver.Chrome) -> bool:
         return False
 
 
+def swipe_left(browser: webdriver.Chrome) -> bool:
+    """
+    Swipe left (dislike/pass) on the current profile.
+    Returns True if swipe was successful, False otherwise.
+    """
+    try:
+        # Selector for the dislike/pass button
+        dislike_button_selector = '.encounters-action.encounters-action--dislike[data-qa-role="encounters-action-dislike"]'
+        
+        # Alternative selectors for the X/pass button
+        alternative_selectors = [
+            '[data-qa-role="encounters-action-dislike"]',
+            '.encounters-action--dislike[role="button"]',
+            '.encounters-action--dislike',
+            '[aria-label="Pass"]',
+            '[aria-label*="Pass"]',
+            '[aria-label="Dislike"]',
+            '[aria-label*="Dislike"]',
+            '[data-testid="dislike-button"]',
+            '[data-testid="pass-button"]',
+            'button[aria-label*="Pass"]',
+        ]
+        
+        wait = WebDriverWait(browser, 5)
+        
+        # Try primary selector first
+        try:
+            dislike_button = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, dislike_button_selector)))
+            dislike_button.click()
+            print(f"{RED} Swiped left (dislike button clicked)")
+            return True
+        except TimeoutException:
+            pass
+        
+        # Try alternative selectors
+        for selector in alternative_selectors:
+            try:
+                dislike_button = browser.find_element(By.CSS_SELECTOR, selector)
+                if dislike_button.is_displayed() and dislike_button.is_enabled():
+                    dislike_button.click()
+                    print(f"{RED} Swiped left (alternative selector: {selector})")
+                    return True
+            except (NoSuchElementException, ElementNotInteractableException):
+                continue
+        
+        # Try JavaScript click as fallback
+        try:
+            result = browser.execute_script("""
+                // Try multiple selectors based on actual Bumble HTML structure
+                const selectors = [
+                    '[data-qa-role="encounters-action-dislike"]',
+                    '.encounters-action--dislike[role="button"]',
+                    '.encounters-action.encounters-action--dislike',
+                    '[aria-label="Pass"]',
+                    '[aria-label="Dislike"]'
+                ];
+                
+                for (const selector of selectors) {
+                    const dislikeButton = document.querySelector(selector);
+                    if (dislikeButton && dislikeButton.offsetParent !== null) {
+                        dislikeButton.click();
+                        return true;
+                    }
+                }
+                return false;
+            """)
+            if result:
+                print(f"{RED} Swiped left (JavaScript click)")
+                return True
+        except Exception as e:
+            print(f"{YELLOW} JavaScript click failed: {e}")
+            pass
+        
+        print(f"{YELLOW} Warning: Could not find or click dislike button")
+        return False
+        
+    except Exception as e:
+        print(f"{YELLOW} Warning: Error swiping left: {e}")
+        return False
+
+
 def handle_match_popup(browser: webdriver.Chrome) -> bool:
     """
     Handle match popup or continue button after a match.
@@ -1886,7 +1967,7 @@ def save_profile_to_json(profile_data: Dict, json_file: str) -> bool:
 def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1.5,
                     output_format: str = 'json', output_file: str = None, headless: bool = True,
                     location: str = None, no_swipe: bool = False, keep_browser_open: bool = False,
-                    save_to_notion: bool = False, gender: str = None):
+                    save_to_notion: bool = False, gender: str = None, dislike: bool = False):
     """
     Scrape Bumble profiles by extracting data before swiping right.
     
@@ -1901,14 +1982,17 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
         no_swipe: If True, extract data without swiping (default: False - will swipe after extraction)
         save_to_notion: If True, save each profile to Notion with retry logic
         gender: Optional gender to set for all scraped profiles (e.g., "female", "male", "non-binary")
+        dislike: If True, swipe left (dislike/pass) instead of right (like)
     """
     browser = None
     try:
         print(f"{CYAN} Initializing Bumble scraper...")
         if no_swipe:
             print(f"{CYAN} Mode: Extract profile data ONLY (no swiping)")
+        elif dislike:
+            print(f"{CYAN} Mode: Extract and SWIPE LEFT (dislike)")
         else:
-            print(f"{CYAN} Mode: Extract profile data BEFORE swiping right")
+            print(f"{CYAN} Mode: Extract and swipe RIGHT (like)")
         print(f"{CYAN} Headless: {headless}")
         if gender:
             print(f"{CYAN} Gender: {gender} (will be set for all scraped profiles)")
@@ -2444,7 +2528,7 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
                 # Swipe/click to move to next profile instead of retrying the same one
                 if not no_swipe:
                     print(f"{CYAN} Attempting to swipe/click to move to next profile...")
-                    swipe_success = swipe_right(browser)
+                    swipe_success = swipe_left(browser) if dislike else swipe_right(browser)
                     if not swipe_success:
                         # Try clicking continue button as fallback
                         handle_match_popup(browser)
@@ -2470,9 +2554,13 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
                 print(f"{CYAN} No-swipe mode: Extracted profile {profile_count}, stopping (cannot see next profile without swiping)")
                 break
             else:
-                # Swipe right to see next profile
-                print(f"{CYAN} Swiping right on profile {profile_count}...")
-                swipe_success = swipe_right(browser)
+                # Swipe to see next profile
+                if dislike:
+                    print(f"{CYAN} Swiping left (dislike) on profile {profile_count}...")
+                    swipe_success = swipe_left(browser)
+                else:
+                    print(f"{CYAN} Swiping right (like) on profile {profile_count}...")
+                    swipe_success = swipe_right(browser)
                 
                 if not swipe_success:
                     print(f"{YELLOW} Warning: Swipe failed - profile may have already been swiped")
@@ -2638,6 +2726,8 @@ def main():
                         help='Save each profile directly to Notion with retry logic (fallback to JSON if fails)')
     parser.add_argument('--gender', type=str, default=None,
                         help='Set gender for all scraped profiles (e.g., "female", "male", "non-binary")')
+    parser.add_argument('--dislike', dest='dislike', action='store_true', default=False,
+                        help='Swipe left (dislike/pass) instead of swiping right (like)')
     
     args = parser.parse_args()
     
@@ -2657,7 +2747,8 @@ def main():
         no_swipe=args.no_swipe,
         keep_browser_open=args.keep_browser_open,
         save_to_notion=args.save_to_notion,
-        gender=args.gender
+        gender=args.gender,
+        dislike=args.dislike
     )
 
 
