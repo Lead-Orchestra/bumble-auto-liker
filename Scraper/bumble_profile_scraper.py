@@ -1967,7 +1967,8 @@ def save_profile_to_json(profile_data: Dict, json_file: str) -> bool:
 def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1.5,
                     output_format: str = 'json', output_file: str = None, headless: bool = True,
                     location: str = None, no_swipe: bool = False, keep_browser_open: bool = False,
-                    save_to_notion: bool = False, gender: str = None, dislike: bool = False):
+                    save_to_notion: bool = False, gender: str = None, dislike: bool = False,
+                    upload_images: bool = False):
     """
     Scrape Bumble profiles by extracting data before swiping right.
     
@@ -1983,7 +1984,21 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
         save_to_notion: If True, save each profile to Notion with retry logic
         gender: Optional gender to set for all scraped profiles (e.g., "female", "male", "non-binary")
         dislike: If True, swipe left (dislike/pass) instead of right (like)
+        upload_images: If True, upload profile images to S3 for permanent storage
     """
+    # Initialize S3 handler if upload_images is enabled
+    s3_handler = None
+    if upload_images:
+        try:
+            from s3_image_handler import S3ImageHandler
+            s3_handler = S3ImageHandler()
+            print(f"{CYAN} S3 Image Upload: ENABLED (uploading to bucket: {s3_handler.bucket})")
+        except ImportError as e:
+            print(f"{YELLOW} S3 upload disabled: boto3 not installed. Run: pip install boto3")
+            s3_handler = None
+        except Exception as e:
+            print(f"{RED} S3 handler initialization failed: {e}")
+            s3_handler = None
     browser = None
     try:
         print(f"{CYAN} Initializing Bumble scraper...")
@@ -2491,6 +2506,15 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
             # Profile data should now always have a name (either extracted or placeholder)
             # Save profile data (name should be present at this point)
             if profile_data and profile_data.get("name"):
+                # STEP 0: Upload images to S3 if enabled (do this before any saving)
+                if s3_handler and profile_data.get('image_urls'):
+                    try:
+                        profile_data = s3_handler.process_profile_images(profile_data)
+                    except Exception as e:
+                        print(f"{YELLOW} S3 upload failed for {profile_data.get('name', 'Unknown')}: {e}")
+                        # Continue with original URLs as fallback
+                        profile_data['s3_image_urls'] = profile_data.get('image_urls', [])
+                
                 # STEP 1: Save to JSON immediately (backup) - ALWAYS do this first
                 json_saved = False
                 if json_backup_file:
@@ -2728,6 +2752,8 @@ def main():
                         help='Set gender for all scraped profiles (e.g., "female", "male", "non-binary")')
     parser.add_argument('--dislike', dest='dislike', action='store_true', default=False,
                         help='Swipe left (dislike/pass) instead of swiping right (like)')
+    parser.add_argument('--upload-images', dest='upload_images', action='store_true', default=False,
+                        help='Upload profile images to S3 for permanent storage (requires boto3 and AWS credentials)')
     
     args = parser.parse_args()
     
@@ -2748,7 +2774,8 @@ def main():
         keep_browser_open=args.keep_browser_open,
         save_to_notion=args.save_to_notion,
         gender=args.gender,
-        dislike=args.dislike
+        dislike=args.dislike,
+        upload_images=args.upload_images
     )
 
 
