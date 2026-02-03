@@ -18,6 +18,8 @@ import subprocess
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Optional
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
 
 try:
     import undetected_chromedriver as uc
@@ -1963,6 +1965,55 @@ def save_profile_to_json(profile_data: Dict, json_file: str) -> bool:
         print(f"{YELLOW} Error saving profile to JSON: {e}")
         return False
 
+def scrape_worker(worker_id, total_workers, args_dict):
+    """
+    Worker function for parallel scraping.
+    """
+    # Stagger starts to avoid undetected_chromedriver conflicts
+    if total_workers > 1:
+        stagger_time = worker_id * args_dict.get('stagger', 5)
+        print(f"{CYAN} [Worker {worker_id}] Staggering start by {stagger_time} seconds...")
+        time.sleep(stagger_time)
+        
+    print(f"{GREEN} [Worker {worker_id}] Starting scraper instance...")
+    
+    # Extract arguments for scrape_profiles
+    try:
+        # Create a worker-specific output file if not provided
+        if not args_dict.get('output_file'):
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            args_dict['output_file'] = f"bumble_profiles_worker{worker_id}_{timestamp}.{args_dict.get('output_format', 'json')}"
+        else:
+            # Append worker ID to the provided output file
+            # If it's a path like results.json, make it results_worker0.json
+            output_path = args_dict.get('output') or args_dict.get('output_file')
+            if output_path:
+                path = Path(output_path)
+                args_dict['output_file'] = str(path.parent / f"{path.stem}_worker{worker_id}{path.suffix}")
+            
+        scrape_profiles(
+            cookie_file=args_dict.get('cookie_file'),
+            limit=args_dict.get('limit'),
+            delay=args_dict.get('delay', 1.5),
+            output_format=args_dict.get('format', 'json'),
+            output_file=args_dict.get('output_file'),
+            headless=args_dict.get('headless', True),
+            location=args_dict.get('location'),
+            no_swipe=args_dict.get('no_swipe', False),
+            keep_browser_open=args_dict.get('keep_browser_open', False),
+            save_to_notion=args_dict.get('save_to_notion', False),
+            gender=args_dict.get('gender'),
+            dislike=args_dict.get('dislike', False),
+            upload_images=args_dict.get('upload_images', False)
+        )
+        print(f"{GREEN} [Worker {worker_id}] Completed successfully.")
+        return True
+    except Exception as e:
+        print(f"{RED} [Worker {worker_id}] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
 
 def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1.5,
                     output_format: str = 'json', output_file: str = None, headless: bool = True,
@@ -2754,6 +2805,10 @@ def main():
                         help='Swipe left (dislike/pass) instead of swiping right (like)')
     parser.add_argument('--upload-images', dest='upload_images', action='store_true', default=False,
                         help='Upload profile images to S3 for permanent storage (requires boto3 and AWS credentials)')
+    parser.add_argument('--workers', type=int, default=1,
+                        help='Number of browser instances to run in parallel (default: 1)')
+    parser.add_argument('--stagger', type=int, default=5,
+                        help='Seconds to stagger startup of each worker (default: 5)')
     
     args = parser.parse_args()
     
@@ -2762,21 +2817,45 @@ def main():
     if args.headless is None:
         args.headless = True  # Default to headless for automation
     
-    scrape_profiles(
-        cookie_file=args.cookie_file,
-        limit=args.limit,
-        delay=args.delay,
-        output_format=args.format,
-        output_file=args.output,
-        headless=args.headless,
-        location=args.location,
-        no_swipe=args.no_swipe,
-        keep_browser_open=args.keep_browser_open,
-        save_to_notion=args.save_to_notion,
-        gender=args.gender,
-        dislike=args.dislike,
-        upload_images=args.upload_images
-    )
+    if args.workers > 1:
+        print(f"{CYAN} Launching {args.workers} workers in parallel...")
+        # Convert args to dict for pickling
+        args_dict = vars(args)
+        
+        # Windows multiprocessing fix
+        if sys.platform == 'win32':
+            import multiprocessing
+            multiprocessing.freeze_support()
+            
+        with ProcessPoolExecutor(max_workers=args.workers) as executor:
+            futures = [
+                executor.submit(scrape_worker, i, args.workers, args_dict.copy()) 
+                for i in range(args.workers)
+            ]
+            
+            # Wait for completion
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    print(f"{RED} Worker failed with error: {e}")
+    else:
+        # Run single instance (original behavior)
+        scrape_profiles(
+            cookie_file=args.cookie_file,
+            limit=args.limit,
+            delay=args.delay,
+            output_format=args.format,
+            output_file=args.output,
+            headless=args.headless,
+            location=args.location,
+            no_swipe=args.no_swipe,
+            keep_browser_open=args.keep_browser_open,
+            save_to_notion=args.save_to_notion,
+            gender=args.gender,
+            dislike=args.dislike,
+            upload_images=args.upload_images
+        )
 
 
 if __name__ == '__main__':

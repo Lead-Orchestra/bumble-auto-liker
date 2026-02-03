@@ -43,7 +43,7 @@ class S3ImageHandler:
         prefix: str = None,
         access_key_id: str = None,
         secret_access_key: str = None,
-        region: str = 'us-east-1'
+        region: str = None
     ):
         """
         Initialize the S3 handler.
@@ -53,7 +53,7 @@ class S3ImageHandler:
             prefix: S3 key prefix (defaults to S3_PREFIX env var)
             access_key_id: AWS access key (defaults to AWS_ACCESS_KEY_ID env var)
             secret_access_key: AWS secret key (defaults to AWS_SECRET_ACCESS_KEY env var)
-            region: AWS region (defaults to us-east-1)
+            region: AWS region (defaults to AWS_REGION env var or us-west-2)
         """
         if boto3 is None:
             raise ImportError(
@@ -62,15 +62,41 @@ class S3ImageHandler:
         
         self.bucket = bucket or os.getenv('S3_BUCKET', 'peridot-partner-ingress')
         self.prefix = prefix or os.getenv('S3_PREFIX', 'dealscale/bumble/')
-        self.region = region
+        self.region = region or os.getenv('AWS_REGION', 'us-west-2')
         
         # Initialize S3 client
         self.s3_client = boto3.client(
             's3',
             aws_access_key_id=access_key_id or os.getenv('AWS_ACCESS_KEY_ID'),
             aws_secret_access_key=secret_access_key or os.getenv('AWS_SECRET_ACCESS_KEY'),
-            region_name=region
+            region_name=self.region
         )
+        
+        # Whether to use presigned URLs (useful if public access is blocked)
+        # Default to True because current bucket settings seem to block public access
+        self.use_presigned_urls = os.getenv('S3_USE_PRESIGNED_URLS', 'true').lower() == 'true'
+        
+    def generate_presigned_url(self, key: str, expiration: int = 604800) -> Optional[str]:
+        """
+        Generate a presigned URL for an S3 object (default 7 days).
+        
+        Args:
+            key: S3 object key
+            expiration: Time in seconds until the URL expires
+            
+        Returns:
+            Presigned URL string
+        """
+        try:
+            url = self.s3_client.generate_presigned_url(
+                'get_object',
+                Params={'Bucket': self.bucket, 'Key': key},
+                ExpiresIn=expiration
+            )
+            return url
+        except ClientError as e:
+            print(f"[X] Failed to generate presigned URL: {e}")
+            return None
         
     def download_image(self, url: str, timeout: int = 30) -> Optional[bytes]:
         """
@@ -134,14 +160,34 @@ class S3ImageHandler:
             Public URL of the uploaded image, or None on failure
         """
         try:
-            self.s3_client.put_object(
-                Bucket=self.bucket,
-                Key=key,
-                Body=image_data,
-                ContentType=content_type
-            )
-            # Generate public URL (assumes bucket allows public access)
-            url = f"https://{self.bucket}.s3.amazonaws.com/{key}"
+            # Attempt to upload with public-read ACL
+            try:
+                self.s3_client.put_object(
+                    Bucket=self.bucket,
+                    Key=key,
+                    Body=image_data,
+                    ContentType=content_type,
+                    ACL='public-read'
+                )
+            except ClientError as e:
+                # If public-read ACL is blocked by bucket policy (BPA), upload without ACL
+                if e.response['Error']['Code'] == 'AccessDenied' or 'AccessControlListNotSupported' in str(e):
+                    print(f"[*] Public ACL blocked by bucket settings, uploading without explicit ACL...")
+                    self.s3_client.put_object(
+                        Bucket=self.bucket,
+                        Key=key,
+                        Body=image_data,
+                        ContentType=content_type
+                    )
+                else:
+                    raise e
+                    
+            # Generate URL
+            if self.use_presigned_urls:
+                url = self.generate_presigned_url(key)
+            else:
+                # Generate public URL (assumes bucket allows public access)
+                url = f"https://{self.bucket}.s3.amazonaws.com/{key}"
             return url
         except (ClientError, NoCredentialsError) as e:
             print(f"[X] Failed to upload to S3: {e}")
