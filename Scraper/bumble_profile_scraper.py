@@ -25,10 +25,9 @@ try:
     import undetected_chromedriver as uc
     from selenium import webdriver
     from selenium.webdriver.common.by import By
-    from selenium.webdriver.common.keys import Keys
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
-    from selenium.common.exceptions import TimeoutException, NoSuchElementException, ElementNotInteractableException
+    from selenium.common.exceptions import NoSuchElementException, ElementNotInteractableException, TimeoutException, ElementClickInterceptedException
 except ImportError as e:
     print(f"[X] Error: Missing required package: {e}")
     print("[+] Please install requirements: cd .. && uv pip install selenium undetected-chromedriver")
@@ -39,6 +38,11 @@ GREEN = "[OK]"
 RED = "[X]"
 YELLOW = "[!]"
 CYAN = "[*]"
+
+try:
+    from browser_launcher import BrowserLauncher
+except Exception:
+    BrowserLauncher = None
 
 # Safe print function that handles Unicode encoding errors
 def safe_print(*args, **kwargs):
@@ -57,6 +61,113 @@ def safe_print(*args, **kwargs):
             else:
                 encoded_args.append(str(arg))
         print(*encoded_args, **kwargs)
+
+
+def create_chrome_options(headless: bool) -> uc.ChromeOptions:
+    """Create a new ChromeOptions object (cannot be reused)."""
+    options = uc.ChromeOptions()
+    # Use --headless=old instead of --headless=new (more reliable on Windows)
+    if headless:
+        options.add_argument('--headless=old')
+    options.add_argument('--no-sandbox')
+    options.add_argument('--disable-dev-shm-usage')
+    options.add_argument('--disable-blink-features=AutomationControlled')
+    options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+    return options
+
+
+def detect_chrome_version(headless: bool) -> Optional[int]:
+    """Best-effort Chrome version detection for Windows environments."""
+    chrome_version = None
+    try:
+        if sys.platform == 'win32':
+            # Windows: Check registry for Chrome version
+            try:
+                result = subprocess.run(
+                    ['reg', 'query', 'HKEY_CURRENT_USER\\Software\\Google\\Chrome\\BLBeacon', '/v', 'version'],
+                    capture_output=True, text=True, timeout=5
+                )
+                if result.returncode == 0:
+                    match = re.search(r'version\\s+REG_SZ\\s+(\\d+)', result.stdout)
+                    if match:
+                        chrome_version = int(match.group(1))
+                        print(f"{CYAN} Detected Chrome version: {chrome_version}")
+            except Exception as e:
+                print(f"{YELLOW} Could not detect Chrome version from registry: {e}")
+                # Try alternative method: check Chrome executable
+                try:
+                    chrome_paths = [
+                        os.path.expanduser('~\\AppData\\Local\\Google\\Chrome\\Application\\chrome.exe'),
+                        'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+                        'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+                    ]
+                    for chrome_path in chrome_paths:
+                        if os.path.exists(chrome_path):
+                            version_args = [chrome_path, '--version']
+                            if headless:
+                                version_args.extend(['--headless=old', '--disable-gpu', '--no-sandbox'])
+                            result = subprocess.run(
+                                version_args,
+                                capture_output=True, text=True, timeout=5
+                            )
+                            if result.returncode == 0:
+                                match = re.search(r'(\\d+)\\.', result.stdout)
+                                if match:
+                                    chrome_version = int(match.group(1))
+                                    print(f"{CYAN} Detected Chrome version from executable: {chrome_version}")
+                                    break
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"{YELLOW} Could not detect Chrome version: {e}")
+    return chrome_version
+
+
+def get_browser(headless: bool, chrome_version: Optional[int] = None, prefer_launcher: bool = False):
+    """Create a browser instance using shared logic and optional BrowserLauncher."""
+    if prefer_launcher and BrowserLauncher:
+        try:
+            launcher = BrowserLauncher(headless=headless)
+            browser, launcher_version = launcher.launch()
+            return browser, launcher_version
+        except Exception as e:
+            print(f"{YELLOW} BrowserLauncher failed, falling back to direct launch: {e}")
+
+    if chrome_version is None:
+        chrome_version = detect_chrome_version(headless)
+
+    try:
+        if chrome_version:
+            print(f"{CYAN} Using detected Chrome version: {chrome_version}")
+            options = create_chrome_options(headless)
+            browser = uc.Chrome(options=options, version_main=chrome_version, headless=headless, use_subprocess=not headless)
+        else:
+            print(f"{CYAN} Using auto-detection for Chrome version...")
+            options = create_chrome_options(headless)
+            browser = uc.Chrome(options=options, version_main=None, headless=headless, use_subprocess=not headless)
+    except Exception as e:
+        error_msg = str(e)
+        print(f"{YELLOW} Initial browser initialization failed: {error_msg[:300]}")
+
+        if 'Chrome version' in error_msg or 'ChromeDriver only supports' in error_msg:
+            print(f"{CYAN} Attempting to fix ChromeDriver version mismatch...")
+            match = re.search(r'Current browser version is (\\d+)\\.', error_msg)
+            if match:
+                actual_chrome_version = int(match.group(1))
+                print(f"{CYAN} Detected actual Chrome version from error: {actual_chrome_version}")
+                if actual_chrome_version != chrome_version:
+                    chrome_version = actual_chrome_version
+                    print(f"{CYAN} Retrying with correct Chrome version: {chrome_version}")
+                    options = create_chrome_options(headless)
+                    browser = uc.Chrome(options=options, version_main=chrome_version, headless=headless, use_subprocess=not headless)
+                else:
+                    raise
+            else:
+                raise
+        else:
+            raise
+
+    return browser, chrome_version
 
 
 def load_cookies_from_file(cookie_file: str) -> Optional[List[Dict]]:
@@ -121,9 +232,19 @@ def inject_cookies_to_browser(browser: webdriver.Chrome, cookies: List[Dict]) ->
                 browser.add_cookie(cookie)
                 injected_count += 1
             except Exception as e:
-                # Some cookies might fail (e.g., secure cookies on non-HTTPS, expired, etc.)
-                if 'sameSite' not in str(e).lower():
-                    failed_cookies.append((cookie.get('name', 'unknown'), str(e)))
+                # Retry without domain and sameSite (common Selenium issues)
+                try:
+                    cookie_copy = cookie.copy()
+                    if 'domain' in cookie_copy:
+                        del cookie_copy['domain']
+                    if 'sameSite' in cookie_copy:
+                        del cookie_copy['sameSite']
+                    browser.add_cookie(cookie_copy)
+                    injected_count += 1
+                    print(f"{CYAN} [Retry Success] Injected cookie {cookie['name']} without strict fields")
+                except Exception as e2:
+                    if 'sameSite' not in str(e).lower():
+                        failed_cookies.append((cookie.get('name', 'unknown'), f"{str(e)} | Retry: {str(e2)}"))
         
         if failed_cookies:
             print(f"{YELLOW} Warning: Failed to inject {len(failed_cookies)} cookie(s):")
@@ -182,6 +303,94 @@ def inject_cookies_to_browser(browser: webdriver.Chrome, cookies: List[Dict]) ->
         print(f"{RED} Error injecting cookies: {e}")
         import traceback
         traceback.print_exc()
+        return False
+
+
+def save_cookies_to_file(browser: webdriver.Chrome, file_path: str):
+    """Save current browser cookies to a JSON file"""
+    try:
+        cookies = browser.get_cookies()
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(cookies, f, indent=4)
+        print(f"{GREEN} Successfully saved {len(cookies)} cookies to {file_path}")
+        return True
+    except Exception as e:
+        print(f"{RED} Error saving cookies: {e}")
+        return False
+
+
+def run_login_flow(browser: webdriver.Chrome, cookie_file: str) -> bool:
+    """Guided manual login flow that saves cookies once successful"""
+    try:
+        print(f"\n{CYAN} --- BUMBLE MANUAL LOGIN MODE ---")
+        print(f"{CYAN} 1. A browser window will open.")
+        print(f"{CYAN} 2. Please log in manually using your preferred method.")
+        print(f"{CYAN} 3. Once you reach the swipe deck (profiles appearing), the session will be saved.")
+        print(f"{CYAN} 4. The script will then exit and you can run it normally.")
+        print(f"{CYAN} --------------------------------\n")
+        
+        browser.get("https://www.bumble.com/get-started")
+        
+        while True:
+            current_url = browser.current_url
+            if "bumble.com/app" in current_url or "app.bumble.com" in current_url:
+                print(f"{GREEN} Detected successful login! Redirected to app page.")
+                break
+            
+            # Also check for profile elements in case URL doesn't update immediately
+            try:
+                cards = browser.find_elements(By.CSS_SELECTOR, '.encounters-story-viewer, .encounters-card')
+                if cards:
+                    print(f"{GREEN} Profile cards detected! Session is active.")
+                    break
+            except:
+                pass
+                
+            time.sleep(2)
+            
+        # Give it a second to settle
+        time.sleep(3)
+        
+        # Save cookies
+        print(f"{CYAN} Extracting and saving session cookies...")
+        if save_cookies_to_file(browser, cookie_file):
+            print(f"{GREEN} LOGIN COMPLETE! You can now run the scraper without --login")
+            return True
+        return False
+        
+    except Exception as e:
+        print(f"{RED} Error during login flow: {e}")
+        return False
+
+
+def dismiss_consent_iframe(browser: webdriver.Chrome) -> bool:
+    """Hide consent iframes/overlays that intercept clicks."""
+    try:
+        result = browser.execute_script("""
+            const selectors = [
+                'iframe[id^="sp_message_iframe"]',
+                'iframe[src*="consent.bumble.com"]',
+                '[id^="sp_message_container"]',
+                '.sp_message_container',
+                '.sp_message_overlay',
+                '.sp_veil'
+            ];
+            let changed = false;
+            for (const selector of selectors) {
+                const nodes = document.querySelectorAll(selector);
+                for (const node of nodes) {
+                    node.style.display = 'none';
+                    node.style.visibility = 'hidden';
+                    node.style.pointerEvents = 'none';
+                    changed = true;
+                }
+            }
+            return changed;
+        """)
+        if result:
+            print(f"{CYAN} Dismissed consent iframe/overlay")
+        return bool(result)
+    except Exception:
         return False
 
 
@@ -434,9 +643,15 @@ def extract_profile_data(browser: webdriver.Chrome, gender: str = None) -> Optio
         # Search entire page, not just profile_element, as bio is in encounters-story sections
         # NOTE: Not all profiles have bios - this is normal
         try:
+            # DEBUG: Log all sections found on page to see structure
+            all_sections = browser.find_elements(By.CSS_SELECTOR, 'section.encounters-story-section')
+            if all_sections:
+                section_classes = [s.get_attribute('class') for s in all_sections]
+                print(f"{CYAN} Found {len(all_sections)} sections: {section_classes}")
+
             bio_selectors = [
-                '.encounters-story-section--about .encounters-story-about__text',  # Primary: bio in "About" section
-                '.encounters-story-about__text',  # Fallback
+                '.encounters-story-about__text',  # Highest priority: specific bio class
+                '.encounters-story-section--about .encounters-story-about__text',
                 '.encounters-story-section--about p',
                 '.encounters-story-section__content p',
             ]
@@ -447,38 +662,81 @@ def extract_profile_data(browser: webdriver.Chrome, gender: str = None) -> Optio
                     bio_elems = browser.find_elements(By.CSS_SELECTOR, selector)
                     for bio_elem in bio_elems:
                         try:
-                            # Check if this is in the "About" section (not question answers)
-                            parent = bio_elem.find_element(By.XPATH, './ancestor::section[contains(@class, "encounters-story-section")]')
-                            section_class = parent.get_attribute('class') or ''
-                            
-                            # Only extract from "About" section, not question sections
-                            if 'encounters-story-section--about' in section_class or 'encounters-story-section--question' not in section_class:
-                                bio_text = bio_elem.text.strip()
-                                # Filter out question answers (they're usually longer and have different structure)
-                                if bio_text and bio_text not in bio_parts and len(bio_text) > 5:  # Allow shorter bios
-                                    # Skip if it looks like a question answer (contains bullet points or multiple lines)
-                                    if not (bio_text.count('\n') > 2 or bio_text.count('-') > 2):
-                                        bio_parts.append(bio_text)
-                        except:
-                            # If we can't check parent, try to extract anyway but be more selective
-                            try:
-                                bio_text = bio_elem.text.strip()
-                                if bio_text and len(bio_text) > 5 and len(bio_text) < 500:  # Reasonable bio length
-                                    bio_parts.append(bio_text)
-                            except:
+                            # Log every potential bio element found
+                            raw_text = bio_elem.text.strip()
+                            if not raw_text:
                                 continue
+                                
+                            # Get parent section class to log context
+                            section_class = "unknown-section"
+                            try:
+                                parent = bio_elem.find_element(By.XPATH, './ancestor::section[contains(@class, "encounters-story-section")]')
+                                section_class = parent.get_attribute('class') or ''
+                                print(f"{CYAN} Found potential bio text in {section_class}: {raw_text[:50]}...")
+                            except:
+                                print(f"{CYAN} Found potential bio text (no section): {raw_text[:50]}...")
+                            
+                            # PRIORITIZE specific bio class
+                            is_specific_bio_class = 'encounters-story-about__text' in (bio_elem.get_attribute('class') or '')
+                            
+                            # Check if this is in the "About" section
+                            is_about_section = 'encounters-story-section--about' in section_class
+                            is_not_question = 'encounters-story-section--question' not in section_class
+                            is_not_location = 'location' not in section_class
+                            is_not_spotify = 'spotify' not in section_class
+                            
+                            # Logic:
+                            # 1. If it has the specific bio class, WE WANT IT.
+                            # 2. If it's in the about section, WE WANT IT.
+                            # 3. If it's NOT a queston/location/spotify section, we check if it looks like a bio.
+                            if is_specific_bio_class or is_about_section or (is_not_question and is_not_location and is_not_spotify):
+                                if raw_text not in bio_parts and len(raw_text) > 1:
+                                    # Looser length filtering
+                                    if len(raw_text) < 1500:
+                                        bio_parts.append(raw_text)
+                                        print(f"{GREEN} Accepted as bio part: {raw_text[:30]}...")
+                        except:
+                            continue
                 except NoSuchElementException:
                     continue
             
+            # Final bio assembly
+            if not bio_parts:
+                # Fallback: extract text from About section content even if not in <p>
+                try:
+                    about_sections = browser.find_elements(By.CSS_SELECTOR, 'section.encounters-story-section--about')
+                    for section in about_sections:
+                        try:
+                            about_text = browser.execute_script(
+                                """
+                                const section = arguments[0];
+                                const clone = section.cloneNode(true);
+                                clone.querySelectorAll('.pill, .encounters-story-about__badge, .pill__title, .pill__subtitle').forEach(n => n.remove());
+                                const content = clone.querySelector('.encounters-story-section__content') || clone;
+                                return content.innerText || '';
+                                """,
+                                section
+                            ).strip()
+                        except Exception:
+                            about_text = section.text.strip()
+                        if about_text:
+                            about_text = re.sub(r'\s{2,}', ' ', about_text).strip()
+                            if about_text:
+                                bio_parts.append(about_text)
+                                break
+                except Exception:
+                    pass
+
             if bio_parts:
-                # Join and clean up bio
-                bio_text = '\n'.join(bio_parts).strip()
-                profile_data["bio"] = bio_text
-                print(f"{CYAN} Extracted bio: {len(bio_text)} characters")
+                bio_text = "\n".join(bio_parts).strip()
+                # Remove excessive newlines
+                while "\n\n\n" in bio_text:
+                    bio_text = bio_text.replace("\n\n\n", "\n\n")
+                profile_data['bio'] = bio_text
+                print(f"{GREEN} [OK] Extracted bio ({len(bio_text)} characters)")
             else:
-                # No bio found - this is normal for some profiles
-                profile_data["bio"] = None
-                print(f"{CYAN} No bio found (this is normal for some profiles)")
+                profile_data['bio'] = None
+                print(f"{YELLOW} [!] No bio found for this profile")
         except Exception as e:
             print(f"{YELLOW} Error extracting bio: {e}")
             profile_data["bio"] = None
@@ -1171,6 +1429,7 @@ def swipe_right(browser: webdriver.Chrome) -> bool:
     Returns True if swipe was successful, False otherwise.
     """
     try:
+        dismiss_consent_iframe(browser)
         # Selector for the like button - found in actual HTML:
         # <div class="encounters-action tooltip-activator encounters-action--like" 
         #      role="button" data-qa-role="encounters-action-like" aria-label="Like">
@@ -1195,6 +1454,12 @@ def swipe_right(browser: webdriver.Chrome) -> bool:
             like_button.click()
             print(f"{GREEN} Swiped right (like button clicked)")
             return True
+        except ElementClickInterceptedException:
+            if dismiss_consent_iframe(browser):
+                like_button = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, like_button_selector)))
+                like_button.click()
+                print(f"{GREEN} Swiped right (like button clicked after dismiss)")
+                return True
         except TimeoutException:
             pass
         
@@ -1203,14 +1468,21 @@ def swipe_right(browser: webdriver.Chrome) -> bool:
             try:
                 like_button = browser.find_element(By.CSS_SELECTOR, selector)
                 if like_button.is_displayed() and like_button.is_enabled():
-                    like_button.click()
+                    try:
+                        like_button.click()
+                    except ElementClickInterceptedException:
+                        if dismiss_consent_iframe(browser):
+                            like_button.click()
+                        else:
+                            raise
                     print(f"{GREEN} Swiped right (alternative selector: {selector})")
                     return True
-            except (NoSuchElementException, ElementNotInteractableException):
+            except (NoSuchElementException, ElementNotInteractableException, ElementClickInterceptedException):
                 continue
         
         # Try JavaScript click as fallback - use the correct selector from HTML
         try:
+            dismiss_consent_iframe(browser)
             result = browser.execute_script("""
                 // Try multiple selectors based on actual Bumble HTML structure
                 const selectors = [
@@ -1250,6 +1522,7 @@ def swipe_left(browser: webdriver.Chrome) -> bool:
     Returns True if swipe was successful, False otherwise.
     """
     try:
+        dismiss_consent_iframe(browser)
         # Selector for the dislike/pass button
         dislike_button_selector = '.encounters-action.encounters-action--dislike[data-qa-role="encounters-action-dislike"]'
         
@@ -1275,6 +1548,12 @@ def swipe_left(browser: webdriver.Chrome) -> bool:
             dislike_button.click()
             print(f"{RED} Swiped left (dislike button clicked)")
             return True
+        except ElementClickInterceptedException:
+            if dismiss_consent_iframe(browser):
+                dislike_button = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, dislike_button_selector)))
+                dislike_button.click()
+                print(f"{RED} Swiped left (dislike button clicked after dismiss)")
+                return True
         except TimeoutException:
             pass
         
@@ -1283,14 +1562,21 @@ def swipe_left(browser: webdriver.Chrome) -> bool:
             try:
                 dislike_button = browser.find_element(By.CSS_SELECTOR, selector)
                 if dislike_button.is_displayed() and dislike_button.is_enabled():
-                    dislike_button.click()
+                    try:
+                        dislike_button.click()
+                    except ElementClickInterceptedException:
+                        if dismiss_consent_iframe(browser):
+                            dislike_button.click()
+                        else:
+                            raise
                     print(f"{RED} Swiped left (alternative selector: {selector})")
                     return True
-            except (NoSuchElementException, ElementNotInteractableException):
+            except (NoSuchElementException, ElementNotInteractableException, ElementClickInterceptedException):
                 continue
         
         # Try JavaScript click as fallback
         try:
+            dismiss_consent_iframe(browser)
             result = browser.execute_script("""
                 // Try multiple selectors based on actual Bumble HTML structure
                 const selectors = [
@@ -1702,7 +1988,7 @@ def set_location(browser: webdriver.Chrome, location: str) -> bool:
         return False
 
 
-def save_profile_to_notion(profile_data: Dict, backend_root: str = None, merge_duplicates: bool = False) -> bool:
+def save_profile_to_notion(profile_data: Dict, backend_root: str = None, merge_duplicates: bool = False, force_save: bool = False) -> bool:
     """
     Save a profile to Notion using the Node.js script with retry logic.
     Returns True if successful, False otherwise.
@@ -1718,7 +2004,7 @@ def save_profile_to_notion(profile_data: Dict, backend_root: str = None, merge_d
         script_path = Path(backend_root) / 'scripts' / 'save-bumble-profile-to-notion.ts'
         
         if not script_path.exists():
-            print(f"{YELLOW} ⚠️  Notion save script not found at {script_path}, skipping Notion save")
+            print(f"{YELLOW} [WARN] Notion save script not found at {script_path}, skipping Notion save")
             return False
         
         # Convert profile data to JSON
@@ -1732,6 +2018,9 @@ def save_profile_to_notion(profile_data: Dict, backend_root: str = None, merge_d
             env_vars = os.environ.copy()
             if merge_duplicates:
                 env_vars['NOTION_UPDATE_DUPLICATES'] = 'true'
+            
+            if force_save:
+                env_vars['NOTION_SKIP_DUPLICATES'] = 'false'
 
             # Try pnpm first (if available)
             result = subprocess.run(
@@ -1751,6 +2040,9 @@ def save_profile_to_notion(profile_data: Dict, backend_root: str = None, merge_d
                 env_vars = os.environ.copy()
                 if merge_duplicates:
                     env_vars['NOTION_UPDATE_DUPLICATES'] = 'true'
+                
+                if force_save:
+                    env_vars['NOTION_SKIP_DUPLICATES'] = 'false'
                     
                 result = subprocess.run(
                     ['npx', 'tsx', str(script_path)],
@@ -1764,11 +2056,11 @@ def save_profile_to_notion(profile_data: Dict, backend_root: str = None, merge_d
                     env=env_vars
                 )
             except FileNotFoundError:
-                print(f"{YELLOW} ⚠️  Could not execute Notion save script (pnpm/npx not found), skipping Notion save")
+                print(f"{YELLOW} [WARN] Could not execute Notion save script (pnpm/npx not found), skipping Notion save")
                 return False
         except subprocess.TimeoutExpired:
             profile_name = profile_data.get('name', 'Unknown')
-            print(f"{YELLOW} ⏱️  Notion save script timed out for {profile_name} (may be retrying), skipping Notion save")
+            print(f"{YELLOW} [TIMEOUT] Notion save script timed out for {profile_name} (may be retrying), skipping Notion save")
             return False
         
         if result and result.returncode == 0:
@@ -1778,16 +2070,16 @@ def save_profile_to_notion(profile_data: Dict, backend_root: str = None, merge_d
                 # Print without the script's own log prefix to avoid duplication
                 lines = [line for line in output.split('\n') if line.strip() and not line.startswith('✅ Loaded')]
                 if lines:
-                    # Replace "✅ Saved:" with "✅ Saved to Notion:"
+                    # Replace "Saved:" with "Saved to Notion:"
                     last_line = lines[-1]
                     if '✅ Saved:' in last_line:
-                        last_line = last_line.replace('✅ Saved:', '✅ Saved to Notion:')
+                        last_line = last_line.replace('✅ Saved:', 'Saved to Notion:')
                     print(f"{CYAN} {last_line}")  # Print last line (the result)
                 return True
             else:
                 # Unexpected success output
                 if output:
-                    print(f"{CYAN} ✅ Saved to Notion: {output}")
+                    print(f"{CYAN} Saved to Notion: {output}")
                 return True
         elif result:
             error_output = result.stderr.strip() or result.stdout.strip()
@@ -1804,11 +2096,11 @@ def save_profile_to_notion(profile_data: Dict, backend_root: str = None, merge_d
                     error_msg = error_lines[0]
                     # Extract profile name if available
                     profile_name = profile_data.get('name', 'Unknown')
-                    print(f"{RED} ❌ Failed to save {profile_name} to Notion: {error_msg}")
+                    print(f"{RED} [FAIL] Failed to save {profile_name} to Notion: {error_msg}")
                 else:
                     # Generic error message
                     profile_name = profile_data.get('name', 'Unknown')
-                    print(f"{RED} ❌ Failed to save {profile_name} to Notion: {error_output[:200]}")
+                    print(f"{RED} [FAIL] Failed to save {profile_name} to Notion: {error_output[:200]}")
                 return False
         else:
             return False
@@ -1820,7 +2112,7 @@ def save_profile_to_notion(profile_data: Dict, backend_root: str = None, merge_d
         except:
             profile_name = 'Unknown'
         error_msg = str(e)
-        print(f"{RED} ❌ Error saving {profile_name} to Notion: {error_msg}")
+        print(f"{RED} [FAIL] Error saving {profile_name} to Notion: {error_msg}")
         return False
 
 
@@ -1923,28 +2215,8 @@ def restart_browser(browser: webdriver.Chrome, cookie_file: str = None, headless
         # Wait a bit before restarting
         time.sleep(2)
         
-        # Reinitialize browser using existing logic
-        def create_chrome_options():
-            """Create a new ChromeOptions object (cannot be reused)"""
-            options = uc.ChromeOptions()
-            # Incremental fix 3: Use --headless=old instead of --headless=new (more reliable on Windows)
-            if headless:
-                options.add_argument('--headless=old')
-            options.add_argument('--no-sandbox')
-            options.add_argument('--disable-dev-shm-usage')
-            options.add_argument('--disable-blink-features=AutomationControlled')
-            options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
-            return options
-        
-        # Create new browser instance
-        if chrome_version:
-            options = create_chrome_options()
-            # Incremental fix 2: Disable use_subprocess when headless (may interfere with headless mode)
-            new_browser = uc.Chrome(options=options, version_main=chrome_version, headless=headless, use_subprocess=not headless)
-        else:
-            options = create_chrome_options()
-            # Incremental fix 2: Disable use_subprocess when headless (may interfere with headless mode)
-            new_browser = uc.Chrome(options=options, version_main=None, headless=headless, use_subprocess=not headless)
+        # Reinitialize browser using shared logic
+        new_browser, _ = get_browser(headless=headless, chrome_version=chrome_version, prefer_launcher=False)
         
         print(f"{GREEN} Browser restarted successfully")
         
@@ -2043,7 +2315,9 @@ def scrape_worker(worker_id, total_workers, args_dict):
             gender=args_dict.get('gender'),
             dislike=args_dict.get('dislike', False),
             upload_images=args_dict.get('upload_images', False),
-            merge_duplicates=args_dict.get('merge_duplicates', False)
+            merge_duplicates=args_dict.get('merge_duplicates', False),
+            force_save=args_dict.get('force_save', False),
+            require_bio=args_dict.get('require_bio', False)
         )
         print(f"{GREEN} [Worker {worker_id}] Completed successfully.")
         return True
@@ -2058,7 +2332,8 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
                     output_format: str = 'json', output_file: str = None, headless: bool = True,
                     location: str = None, no_swipe: bool = False, keep_browser_open: bool = False,
                     save_to_notion: bool = False, gender: str = None, dislike: bool = False,
-                    upload_images: bool = False, merge_duplicates: bool = False):
+                    upload_images: bool = False, merge_duplicates: bool = False, force_save: bool = False,
+                    login_mode: bool = False, require_bio: bool = False):
     """
     Scrape Bumble profiles by extracting data before swiping right.
     
@@ -2076,21 +2351,45 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
         dislike: If True, swipe left (dislike/pass) instead of right (like)
         upload_images: If True, upload profile images to S3 for permanent storage
     """
-    # Initialize S3 handler if upload_images is enabled
     s3_handler = None
     if upload_images:
         try:
             from s3_image_handler import S3ImageHandler
             s3_handler = S3ImageHandler()
             print(f"{CYAN} S3 Image Upload: ENABLED (uploading to bucket: {s3_handler.bucket})")
-        except ImportError as e:
+        except ImportError:
             print(f"{YELLOW} S3 upload disabled: boto3 not installed. Run: pip install boto3")
-            s3_handler = None
         except Exception as e:
             print(f"{RED} S3 handler initialization failed: {e}")
-            s3_handler = None
+
+    # Initialize variables early to avoid UnboundLocalError on interrupt
     browser = None
+    all_profiles = []
+    json_backup_file = None
+    profile_count = 0
+
     try:
+        if login_mode:
+            print(f"{CYAN} Running in LOGIN mode...")
+            # Use default cookie file if none provided
+            if not cookie_file:
+                cookie_file = 'bumble_cookies.json'
+                print(f"{CYAN} No cookie file specified, using default: {cookie_file}")
+            
+            # Login must be non-headless
+            headless = False
+            
+            # Start browser
+            browser, _ = get_browser(headless=headless, prefer_launcher=True)
+            
+            # Run login flow
+            success = run_login_flow(browser, cookie_file)
+            
+            # Exit after login flow
+            if browser:
+                browser.quit()
+            return success
+
         print(f"{CYAN} Initializing Bumble scraper...")
         if no_swipe:
             print(f"{CYAN} Mode: Extract profile data ONLY (no swiping)")
@@ -2106,18 +2405,6 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
         else:
             print(f"{CYAN} Notion saving: DISABLED (profiles will be saved to JSON file only)")
         
-        def create_chrome_options():
-            """Create a new ChromeOptions object (cannot be reused)"""
-            options = uc.ChromeOptions()
-            # Use --headless=old instead of --headless=new (more reliable on Windows)
-            if headless:
-                options.add_argument('--headless=old')
-            options.add_argument('--no-sandbox')
-            options.add_argument('--disable-dev-shm-usage')
-            options.add_argument('--disable-blink-features=AutomationControlled')
-            options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
-            return options
-        
         # Create undetected Chrome driver (undetected-chromedriver handles anti-detection automatically)
         # Let undetected-chromedriver auto-detect and download the correct ChromeDriver version
         # Note: This scraper uses Chrome regardless of where cookies came from (Firefox/Chrome/etc)
@@ -2127,89 +2414,7 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
             print(f"{CYAN} Running in headless mode (no visible browser window)")
         print(f"{CYAN} Auto-detecting Chrome version and downloading compatible ChromeDriver...")
         
-        # Try to detect Chrome version first to ensure we get the right ChromeDriver
-        chrome_version = None
-        try:
-            import subprocess
-            if sys.platform == 'win32':
-                # Windows: Check registry for Chrome version
-                try:
-                    result = subprocess.run(
-                        ['reg', 'query', 'HKEY_CURRENT_USER\\Software\\Google\\Chrome\\BLBeacon', '/v', 'version'],
-                        capture_output=True, text=True, timeout=5
-                    )
-                    if result.returncode == 0:
-                        match = re.search(r'version\s+REG_SZ\s+(\d+)', result.stdout)
-                        if match:
-                            chrome_version = int(match.group(1))
-                            print(f"{CYAN} Detected Chrome version: {chrome_version}")
-                except Exception as e:
-                    print(f"{YELLOW} Could not detect Chrome version from registry: {e}")
-                    # Try alternative method: check Chrome executable
-                    try:
-                        chrome_paths = [
-                            os.path.expanduser('~\\AppData\\Local\\Google\\Chrome\\Application\\chrome.exe'),
-                            'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-                            'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-                        ]
-                        for chrome_path in chrome_paths:
-                            if os.path.exists(chrome_path):
-                                # Fix: Add headless arguments to prevent Chrome from opening visibly during version detection
-                                version_args = [chrome_path, '--version']
-                                if headless:
-                                    version_args.extend(['--headless=old', '--disable-gpu', '--no-sandbox'])
-                                result = subprocess.run(
-                                    version_args,
-                                    capture_output=True, text=True, timeout=5
-                                )
-                                if result.returncode == 0:
-                                    match = re.search(r'(\d+)\.', result.stdout)
-                                    if match:
-                                        chrome_version = int(match.group(1))
-                                        print(f"{CYAN} Detected Chrome version from executable: {chrome_version}")
-                                        break
-                    except:
-                        pass
-        except Exception as e:
-            print(f"{YELLOW} Could not detect Chrome version: {e}")
-        
-        # Try to initialize browser with detected version or auto-detection
-        browser = None
-        try:
-            if chrome_version:
-                print(f"{CYAN} Using detected Chrome version: {chrome_version}")
-                options = create_chrome_options()
-                # Disable use_subprocess when headless (may interfere with headless mode)
-                browser = uc.Chrome(options=options, version_main=chrome_version, headless=headless, use_subprocess=not headless)
-            else:
-                print(f"{CYAN} Using auto-detection for Chrome version...")
-                options = create_chrome_options()
-                # Disable use_subprocess when headless (may interfere with headless mode)
-                browser = uc.Chrome(options=options, version_main=None, headless=headless, use_subprocess=not headless)
-        except Exception as e:
-            error_msg = str(e)
-            print(f"{YELLOW} Initial browser initialization failed: {error_msg[:300]}")
-            
-            # If version mismatch error, try to extract version from error and retry
-            if 'Chrome version' in error_msg or 'ChromeDriver only supports' in error_msg:
-                print(f"{CYAN} Attempting to fix ChromeDriver version mismatch...")
-                # Extract the actual Chrome version from the error message
-                match = re.search(r'Current browser version is (\d+)\.', error_msg)
-                if match:
-                    actual_chrome_version = int(match.group(1))
-                    print(f"{CYAN} Detected actual Chrome version from error: {actual_chrome_version}")
-                    if actual_chrome_version != chrome_version:
-                        chrome_version = actual_chrome_version
-                        print(f"{CYAN} Retrying with correct Chrome version: {chrome_version}")
-                        options = create_chrome_options()
-                        # Incremental fix 2: Disable use_subprocess when headless (may interfere with headless mode)
-                        browser = uc.Chrome(options=options, version_main=chrome_version, headless=headless, use_subprocess=not headless)
-                    else:
-                        raise
-                else:
-                    raise
-            else:
-                raise
+        browser, chrome_version = get_browser(headless=headless, chrome_version=None, prefer_launcher=False)
         browser.maximize_window()
         
         # Execute script to hide webdriver property
@@ -2223,6 +2428,10 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
         
         # Try cookie-based authentication first (recommended)
         logged_in = False
+        if not cookie_file and os.path.exists('bumble_cookies.json'):
+            cookie_file = 'bumble_cookies.json'
+            print(f"{CYAN} Found default cookie file: {cookie_file}")
+
         if cookie_file:
             print(f"{CYAN} Attempting cookie-based authentication...")
             cookies = load_cookies_from_file(cookie_file)
@@ -2230,6 +2439,7 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
                 logged_in = inject_cookies_to_browser(browser, cookies)
                 if logged_in:
                     print(f"{GREEN} Authentication successful via cookies")
+                    dismiss_consent_iframe(browser)
         
         # Navigate to Bumble if not already logged in
         if not logged_in:
@@ -2237,8 +2447,9 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
             browser.get("https://www.bumble.com")
             time.sleep(5)
             
-            # Check if we're on login page
-            if 'login' in browser.current_url.lower() or 'sign-in' in browser.current_url.lower():
+            # Check if we're on login page or landing page
+            current_url = browser.current_url.lower()
+            if 'login' in current_url or 'sign-in' in current_url or 'get-started' in current_url:
                 print(f"{RED} Error: Not logged in and no authentication method provided")
                 print(f"{YELLOW} Please provide --cookies <file> (recommended) - Extract cookies automatically with --auto-session")
                 print(f"{YELLOW} Or manually log in to Bumble in your browser first, then extract cookies")
@@ -2248,6 +2459,7 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
         print(f"{CYAN} Waiting for profile cards to load...")
         print(f"{CYAN} Current URL: {browser.current_url}")
         print(f"{CYAN} Page title: {browser.title}")
+        dismiss_consent_iframe(browser)
         
         # Navigate to the app (encounters) page if needed
         if 'app.bumble.com/app' not in browser.current_url and '/app' not in browser.current_url:
@@ -2352,8 +2564,6 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
             print(f"{YELLOW} Error inspecting page: {e}")
         
         # Scrape profiles
-        all_profiles = []
-        profile_count = 0
         consecutive_failures = 0
         max_consecutive_failures = 3  # Stop after 3 consecutive failures
         daily_limit_hit = False  # Track if we hit the daily limit gracefully
@@ -2388,6 +2598,7 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
                 print(f"{CYAN} Reached limit of {limit} profiles")
                 break
             
+            dismiss_consent_iframe(browser)
             print(f"{CYAN} Profile {profile_count + 1}: Extracting data...")
             
             # Extract profile data BEFORE swiping
@@ -2456,25 +2667,25 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
                     
                     if partial_data:
                         current_fingerprint = create_profile_fingerprint(partial_data)
-                        print(f"{CYAN} Created fingerprint from partial data (name missing): {current_fingerprint[:80]}...")
-                        print(f"{CYAN} Recent fingerprints count: {len(recent_profile_fingerprints)}")
+                        safe_print(f"{CYAN} Created fingerprint from partial data (name missing): {current_fingerprint[:80]}...")
+                        safe_print(f"{CYAN} Recent fingerprints count: {len(recent_profile_fingerprints)}")
                     else:
-                        print(f"{YELLOW} Warning: Could not extract any partial data for fingerprinting")
+                        safe_print(f"{YELLOW} Warning: Could not extract any partial data for fingerprinting")
                 except Exception as e:
-                    print(f"{YELLOW} Could not create fingerprint from partial data: {e}")
+                    safe_print(f"{YELLOW} Could not create fingerprint from partial data: {e}")
                     import traceback
                     traceback.print_exc()
             
             # Check for infinite loop: same profile extracted repeatedly
             if current_fingerprint:
-                print(f"{CYAN} Current fingerprint: {current_fingerprint[:80]}...")
-                print(f"{CYAN} Recent fingerprints: {[fp[:40] + '...' if len(fp) > 40 else fp for fp in recent_profile_fingerprints[-3:]]}")
+                safe_print(f"{CYAN} Current fingerprint: {current_fingerprint[:80]}...")
+                safe_print(f"{CYAN} Recent fingerprints: {[fp[:40] + '...' if len(fp) > 40 else fp for fp in recent_profile_fingerprints[-3:]]}")
                 if len(recent_profile_fingerprints) >= max_loop_detection_count:
                     # Check if last N fingerprints are the same
                     recent_same = all(fp == current_fingerprint for fp in recent_profile_fingerprints[-max_loop_detection_count:])
                     if recent_same:
                         print(f"{RED} ERROR: Infinite loop detected - same profile extracted {max_loop_detection_count} times consecutively")
-                        print(f"{YELLOW} Fingerprint: {current_fingerprint}")
+                        safe_print(f"{YELLOW} Fingerprint: {current_fingerprint}")
                         
                         # Save HTML for debugging
                         html_file = save_stuck_profile_html(browser, profile_count)
@@ -2596,6 +2807,18 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
             # Profile data should now always have a name (either extracted or placeholder)
             # Save profile data (name should be present at this point)
             if profile_data and profile_data.get("name"):
+                if require_bio and not profile_data.get("bio"):
+                    print(f"{YELLOW} Skipping profile without bio (require_bio enabled)")
+                    if no_swipe:
+                        print(f"{YELLOW} require_bio needs swiping to move to next profile; disabling no-swipe")
+                        no_swipe = False
+                    if not no_swipe:
+                        swipe_success = swipe_left(browser) if dislike else swipe_right(browser)
+                        if not swipe_success:
+                            handle_match_popup(browser)
+                        time.sleep(delay)
+                    time.sleep(1)
+                    continue
                 # STEP 0: Upload images to S3 if enabled (do this before any saving)
                 if s3_handler and profile_data.get('image_urls'):
                     try:
@@ -2612,16 +2835,16 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
                     if json_saved:
                         name_display = profile_data.get('name', 'Unknown')
                         if profile_data.get("_name_placeholder"):
-                            print(f"{CYAN} 💾 Saved to JSON backup (placeholder name): {name_display} ({profile_data.get('age', '?')})")
+                            safe_print(f"{CYAN} [SAVE] Saved to JSON backup (placeholder name): {name_display} ({profile_data.get('age', '?')})")
                         else:
-                            print(f"{CYAN} 💾 Saved to JSON backup: {name_display} ({profile_data.get('age', '?')})")
+                            safe_print(f"{CYAN} [SAVE] Saved to JSON backup: {name_display} ({profile_data.get('age', '?')})")
                     else:
-                        print(f"{RED} ❌ Failed to save {profile_data.get('name', 'Unknown')} to JSON backup")
+                        safe_print(f"{RED} [FAIL] Failed to save {profile_data.get('name', 'Unknown')} to JSON backup")
                 
                 # STEP 2: Save to Notion if enabled (after JSON backup)
                 notion_saved = False
                 if save_to_notion:
-                    notion_saved = save_profile_to_notion(profile_data, merge_duplicates=merge_duplicates)
+                    notion_saved = save_profile_to_notion(profile_data, merge_duplicates=merge_duplicates, force_save=force_save)
                     # Note: save_profile_to_notion already prints status messages
                 
                 # Always add to list for final JSON save (redundancy)
@@ -2834,6 +3057,8 @@ def main():
                         help='Set location filter (e.g., "Seattle" or "Seattle, WA")')
     parser.add_argument('--no-swipe', dest='no_swipe', action='store_true', default=False,
                         help='Extract profile data without swiping (useful for testing/inspection)')
+    parser.add_argument('--require-bio', dest='require_bio', action='store_true', default=False,
+                        help='Skip profiles without a bio/about section (requires swiping)')
     parser.add_argument('--keep-browser-open', dest='keep_browser_open', action='store_true', default=False,
                         help='Keep browser open after scraping completes (useful for debugging)')
     parser.add_argument('--save-to-notion', dest='save_to_notion', action='store_true', default=False,
@@ -2846,10 +3071,14 @@ def main():
                         help='Upload profile images to S3 for permanent storage (requires boto3 and AWS credentials)')
     parser.add_argument('--merge-duplicates', dest='merge_duplicates', action='store_true', default=False,
                         help='Update existing profiles in Notion if duplicates are found (default: skip)')
+    parser.add_argument('--force-save', dest='force_save', action='store_true', default=False,
+                        help='Skip duplicate checks entirely and force save profiles (default: False)')
     parser.add_argument('--workers', type=int, default=1,
                         help='Number of browser instances to run in parallel (default: 1)')
     parser.add_argument('--stagger', type=int, default=5,
                         help='Seconds to stagger startup of each worker (default: 5)')
+    parser.add_argument('--login', action='store_true', default=False,
+                        help='Open browser for manual login and save cookies (ignores other flags)')
     
     args = parser.parse_args()
     
@@ -2862,6 +3091,8 @@ def main():
         print(f"{CYAN} Launching {args.workers} workers in parallel...")
         # Convert args to dict for pickling
         args_dict = vars(args)
+        # Ensure force_save is passed
+        args_dict['force_save'] = args_dict.get('force_save', False)
         
         # Windows multiprocessing fix
         if sys.platform == 'win32':
@@ -2896,7 +3127,10 @@ def main():
             gender=args.gender,
             dislike=args.dislike,
             upload_images=args.upload_images,
-            merge_duplicates=args.merge_duplicates
+            merge_duplicates=args.merge_duplicates,
+            force_save=args.force_save,
+            login_mode=args.login,
+            require_bio=args.require_bio
         )
 
 
