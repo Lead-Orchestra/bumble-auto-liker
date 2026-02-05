@@ -15,6 +15,8 @@ import time
 import random
 import re
 import subprocess
+import tempfile
+import shutil
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Optional
@@ -31,7 +33,7 @@ try:
 except ImportError as e:
     print(f"[X] Error: Missing required package: {e}")
     print("[+] Please install requirements: cd .. && uv pip install selenium undetected-chromedriver")
-    sys.exit(1)
+    raise RuntimeError(f"Missing required package: {e}") from e
 
 # Color output (simple ASCII for cross-platform compatibility)
 GREEN = "[OK]"
@@ -123,6 +125,48 @@ def detect_chrome_version(headless: bool) -> Optional[int]:
     return chrome_version
 
 
+def extract_chrome_version_from_error(error_msg: str) -> Optional[int]:
+    match = re.search(r'Current browser version is (\\d+)\\.', error_msg)
+    if match:
+        try:
+            return int(match.group(1))
+        except Exception:
+            return None
+    return None
+
+
+def clear_uc_driver_cache():
+    """Best-effort cleanup for undetected-chromedriver cache on Windows."""
+    cache_dirs = []
+    try:
+        cache_dirs.append(Path.home() / ".undetected_chromedriver")
+    except Exception:
+        pass
+    local_appdata = os.getenv("LOCALAPPDATA")
+    if local_appdata:
+        cache_dirs.append(Path(local_appdata) / "undetected_chromedriver")
+    appdata = os.getenv("APPDATA")
+    if appdata:
+        cache_dirs.append(Path(appdata) / "undetected_chromedriver")
+    try:
+        cache_dirs.append(Path(tempfile.gettempdir()) / "undetected_chromedriver")
+    except Exception:
+        pass
+
+    cleared_any = False
+    for cache_dir in cache_dirs:
+        try:
+            if cache_dir.exists():
+                shutil.rmtree(cache_dir, ignore_errors=True)
+                print(f"{YELLOW} Cleared undetected-chromedriver cache at {cache_dir}")
+                cleared_any = True
+        except Exception as e:
+            print(f"{YELLOW} Could not clear undetected-chromedriver cache at {cache_dir}: {e}")
+
+    if not cleared_any:
+        print(f"{YELLOW} No undetected-chromedriver cache directories found to clear")
+
+
 def get_browser(headless: bool, chrome_version: Optional[int] = None, prefer_launcher: bool = False):
     """Create a browser instance using shared logic and optional BrowserLauncher."""
     if prefer_launcher and BrowserLauncher:
@@ -136,38 +180,65 @@ def get_browser(headless: bool, chrome_version: Optional[int] = None, prefer_lau
     if chrome_version is None:
         chrome_version = detect_chrome_version(headless)
 
-    try:
-        if chrome_version:
-            print(f"{CYAN} Using detected Chrome version: {chrome_version}")
-            options = create_chrome_options(headless)
-            browser = uc.Chrome(options=options, version_main=chrome_version, headless=headless, use_subprocess=not headless)
-        else:
-            print(f"{CYAN} Using auto-detection for Chrome version...")
-            options = create_chrome_options(headless)
-            browser = uc.Chrome(options=options, version_main=None, headless=headless, use_subprocess=not headless)
-    except Exception as e:
-        error_msg = str(e)
-        print(f"{YELLOW} Initial browser initialization failed: {error_msg[:300]}")
+    max_attempts = 3
+    attempt = 0
 
-        if 'Chrome version' in error_msg or 'ChromeDriver only supports' in error_msg:
-            print(f"{CYAN} Attempting to fix ChromeDriver version mismatch...")
-            match = re.search(r'Current browser version is (\\d+)\\.', error_msg)
-            if match:
-                actual_chrome_version = int(match.group(1))
-                print(f"{CYAN} Detected actual Chrome version from error: {actual_chrome_version}")
-                if actual_chrome_version != chrome_version:
-                    chrome_version = actual_chrome_version
-                    print(f"{CYAN} Retrying with correct Chrome version: {chrome_version}")
-                    options = create_chrome_options(headless)
-                    browser = uc.Chrome(options=options, version_main=chrome_version, headless=headless, use_subprocess=not headless)
-                else:
-                    raise
+    while attempt < max_attempts:
+        attempt += 1
+        user_data_dir = None
+        try:
+            print(f"{CYAN} Chrome version target: {chrome_version if chrome_version else 'auto'} (attempt {attempt}/{max_attempts})")
+            if chrome_version:
+                print(f"{CYAN} Using detected Chrome version: {chrome_version}")
             else:
-                raise
-        else:
-            raise
+                print(f"{CYAN} Using auto-detection for Chrome version...")
 
-    return browser, chrome_version
+            options = create_chrome_options(headless)
+            user_data_dir = tempfile.mkdtemp(prefix="bumble-uc-")
+            options.add_argument(f"--user-data-dir={user_data_dir}")
+
+            if chrome_version:
+                browser = uc.Chrome(options=options, version_main=chrome_version, headless=headless, use_subprocess=not headless)
+            else:
+                browser = uc.Chrome(options=options, version_main=None, headless=headless, use_subprocess=not headless)
+
+            browser._bumble_user_data_dir = user_data_dir
+            return browser, chrome_version
+        except Exception as e:
+            if user_data_dir:
+                try:
+                    shutil.rmtree(user_data_dir, ignore_errors=True)
+                except Exception:
+                    pass
+
+            error_msg = str(e)
+            print(f"{YELLOW} Initial browser initialization failed: {error_msg[:300]}")
+
+            if 'Chrome version' in error_msg or 'ChromeDriver only supports' in error_msg:
+                print(f"{CYAN} Attempting to fix ChromeDriver version mismatch...")
+                actual_chrome_version = extract_chrome_version_from_error(error_msg)
+                if actual_chrome_version:
+                    print(f"{CYAN} Detected actual Chrome version from error: {actual_chrome_version}")
+                    if chrome_version != actual_chrome_version:
+                        chrome_version = actual_chrome_version
+                        clear_uc_driver_cache()
+                    print(f"{CYAN} Retrying with correct Chrome version: {chrome_version}")
+                    if attempt < max_attempts:
+                        continue
+                raise
+
+            if 'session not created' in error_msg.lower() and attempt < max_attempts:
+                actual_chrome_version = extract_chrome_version_from_error(error_msg)
+                if actual_chrome_version and chrome_version != actual_chrome_version:
+                    chrome_version = actual_chrome_version
+                    clear_uc_driver_cache()
+                    print(f"{CYAN} Detected actual Chrome version from error: {chrome_version}")
+                retry_delay = random.uniform(0.5, 1.5)
+                print(f"{YELLOW} Session not created (attempt {attempt}/{max_attempts}). Retrying in {retry_delay:.2f}s...")
+                time.sleep(retry_delay)
+                continue
+
+            raise
 
 
 def load_cookies_from_file(cookie_file: str) -> Optional[List[Dict]]:
@@ -2317,7 +2388,8 @@ def scrape_worker(worker_id, total_workers, args_dict):
             upload_images=args_dict.get('upload_images', False),
             merge_duplicates=args_dict.get('merge_duplicates', False),
             force_save=args_dict.get('force_save', False),
-            require_bio=args_dict.get('require_bio', False)
+            require_bio=args_dict.get('require_bio', False),
+            chrome_version=args_dict.get('chrome_version')
         )
         print(f"{GREEN} [Worker {worker_id}] Completed successfully.")
         return True
@@ -2333,7 +2405,8 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
                     location: str = None, no_swipe: bool = False, keep_browser_open: bool = False,
                     save_to_notion: bool = False, gender: str = None, dislike: bool = False,
                     upload_images: bool = False, merge_duplicates: bool = False, force_save: bool = False,
-                    login_mode: bool = False, require_bio: bool = False):
+                    login_mode: bool = False, require_bio: bool = False,
+                    chrome_version: Optional[int] = None):
     """
     Scrape Bumble profiles by extracting data before swiping right.
     
@@ -2380,7 +2453,7 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
             headless = False
             
             # Start browser
-            browser, _ = get_browser(headless=headless, prefer_launcher=True)
+            browser, _ = get_browser(headless=headless, chrome_version=chrome_version, prefer_launcher=True)
             
             # Run login flow
             success = run_login_flow(browser, cookie_file)
@@ -2414,7 +2487,7 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
             print(f"{CYAN} Running in headless mode (no visible browser window)")
         print(f"{CYAN} Auto-detecting Chrome version and downloading compatible ChromeDriver...")
         
-        browser, chrome_version = get_browser(headless=headless, chrome_version=None, prefer_launcher=False)
+        browser, chrome_version = get_browser(headless=headless, chrome_version=chrome_version, prefer_launcher=False)
         browser.maximize_window()
         
         # Execute script to hide webdriver property
@@ -2453,7 +2526,7 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
                 print(f"{RED} Error: Not logged in and no authentication method provided")
                 print(f"{YELLOW} Please provide --cookies <file> (recommended) - Extract cookies automatically with --auto-session")
                 print(f"{YELLOW} Or manually log in to Bumble in your browser first, then extract cookies")
-                sys.exit(1)
+                raise RuntimeError("Not logged in and no authentication method provided")
         
         # Wait for first profile to load
         print(f"{CYAN} Waiting for profile cards to load...")
@@ -2920,10 +2993,10 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
         if not all_profiles:
             if daily_limit_hit:
                 print(f"{CYAN} Daily limit reached before extracting any profiles - exiting gracefully")
-                sys.exit(0)
+                return []
             else:
                 print(f"{RED} Error: No profiles extracted")
-                sys.exit(1)
+                raise RuntimeError("No profiles extracted")
         
         print(f"{GREEN} Successfully extracted {len(all_profiles)} profile(s)")
         
@@ -3019,7 +3092,7 @@ def scrape_profiles(cookie_file: str = None, limit: int = None, delay: float = 1
         print(f"{RED} Error scraping profiles: {e}")
         import traceback
         traceback.print_exc()
-        sys.exit(1)
+        raise RuntimeError(f"Error scraping profiles: {e}") from e
     finally:
         if browser:
             if keep_browser_open:
@@ -3077,6 +3150,8 @@ def main():
                         help='Number of browser instances to run in parallel (default: 1)')
     parser.add_argument('--stagger', type=int, default=5,
                         help='Seconds to stagger startup of each worker (default: 5)')
+    parser.add_argument('--chrome-version', type=int, default=None,
+                        help='Force Chrome major version for matching ChromeDriver (e.g., 144)')
     parser.add_argument('--login', action='store_true', default=False,
                         help='Open browser for manual login and save cookies (ignores other flags)')
     
@@ -3100,17 +3175,27 @@ def main():
             multiprocessing.freeze_support()
             
         with ProcessPoolExecutor(max_workers=args.workers) as executor:
-            futures = [
-                executor.submit(scrape_worker, i, args.workers, args_dict.copy()) 
+            future_to_worker = {
+                executor.submit(scrape_worker, i, args.workers, args_dict.copy()): i
                 for i in range(args.workers)
-            ]
-            
+            }
+
             # Wait for completion
-            for future in as_completed(futures):
-                try:
-                    future.result()
-                except Exception as e:
-                    print(f"{RED} Worker failed with error: {e}")
+            try:
+                for future in as_completed(future_to_worker):
+                    try:
+                        future.result()
+                    except BaseException as e:
+                        if isinstance(e, KeyboardInterrupt):
+                            raise
+                        worker_id = future_to_worker.get(future, "unknown")
+                        print(f"{RED} [Worker {worker_id}] Error: {e}")
+            except KeyboardInterrupt:
+                print(f"{YELLOW} KeyboardInterrupt received. Cancelling workers...")
+                for future in future_to_worker:
+                    future.cancel()
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
     else:
         # Run single instance (original behavior)
         scrape_profiles(
@@ -3130,7 +3215,8 @@ def main():
             merge_duplicates=args.merge_duplicates,
             force_save=args.force_save,
             login_mode=args.login,
-            require_bio=args.require_bio
+            require_bio=args.require_bio,
+            chrome_version=args.chrome_version
         )
 
 
